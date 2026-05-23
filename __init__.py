@@ -8,10 +8,14 @@ if adaptive_prompts_dir not in sys.path:
 
 try:
     from py.plugin_registry import PluginRegistry
-    from .py.syntax_extensions import conditional_bracket_handler, wildcard_strip_handler
+    from .py.syntax_extensions import conditional_bracket_handler, wildcard_strip_handler, is_conditional_bracket_content
     
     PluginRegistry.register_bracket_handler(conditional_bracket_handler)
     PluginRegistry.register_wildcard_handler(wildcard_strip_handler)
+    
+    if hasattr(PluginRegistry, "register_unsequenceable_handler"):
+        PluginRegistry.register_unsequenceable_handler(is_conditional_bracket_content)
+        
     print("[Adaptive Prompts Extensions] Registered syntax extensions (Conditional Branching, Strip Variables).")
 except ImportError:
     pass

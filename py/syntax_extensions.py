@@ -152,6 +152,10 @@ def _split_top_level_pipes(s: str) -> list[str]:
     result.append("".join(current))
     return result
 
+def is_conditional_bracket_content(choice: str) -> bool:
+    """Helper to check if a bracket's first choice is a conditional statement."""
+    return bool(re.match(r"^(if|switch)\s*\(.*?\)$", choice.strip(), re.DOTALL))
+
 def conditional_bracket_handler(content: str, seeded_rng, wildcard_dir, resolved_vars: dict) -> str | None:
     """
     Hooks into bracket parsing to evaluate {if(cond)|A|B} and {switch(var)} syntax.
