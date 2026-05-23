@@ -67,3 +67,90 @@ Each line within a stack acts as an instruction. Alongside standard file paths, 
 - **`context` (DICT):** The accumulated dictionary of variables created during the evaluation of the stack. This can be passed to a Prompt Generator or another Stack Loader.
 - **`lora_string` (STRING):** A clean string containing all `<lora:name:weight>` tags found across all files in the stack, ready to be passed to a LoRA Tag Loader.
 
+## 🔀 Conditional Branching & Logic
+
+> [!WARNING]
+> **Compatibility Limitation**: Conditional branching logic (`if`, `switch`) is exclusively supported when using the **Prompt Generator** or **Prompt Stack Loader** nodes. If you attempt to use conditionals inside the `PromptSequencer` or `PromptRepack` nodes, the core engine will forcefully split and break your logic blocks, resulting in malformed prompts. 
+
+You can now program logic directly into your prompts! Using lightweight condition operators, you can tell the engine to output specific text only if certain variables are set or match specific values. This is incredibly useful for avoiding prompt conflicts (e.g., ensuring "shoes" doesn't appear in a "close-up" portrait).
+
+> [!TIP]
+> **When to use Conditionals vs Nodes:** 
+> While you *can* program complex logic purely with text conditionals, **it is highly recommended to use nodes for macro-level choices.** For example, if you are designing entirely different scenes (like a "from above" layout vs. a "side view" layout), it is much easier to maintain separate Prompt Generators for each, and route them using nodes like `Random Integers` combined with `Switch Any (Impact Pack)`. 
+> 
+> Keep your text-based `if/else` and `switch` statements reserved for **micro-adjustments and fine-tuning** (such as resolving clothing conflicts, swapping a specific detail, or conditionally amplifying a tag's impact based on another variable).
+
+### If / Else Statements
+You can use `{if(condition) | then | else}` syntax. The `| else` part is optional.
+
+**Lightweight Operators:**
+*   `?var` -> **(Is Defined)** True if the variable `var` has been assigned.
+*   `!var` -> **(Not Defined)** True if `var` has NOT been assigned.
+*   `var~tag` -> **(Contains)** True if the variable's value contains `tag`.
+*   `var!~tag` -> **(Not Contains)** True if it does NOT contain `tag`.
+*   `var==value` -> **(Equals)** True if it exactly matches `value`.
+*   `var!=value` -> **(Not Equals)** True if it does NOT exactly match.
+*   `var>value`  -> **(Greater Than)** True if variable weight is greater than value.
+*   `var<value`  -> **(Less Than)** True if variable weight is less than value.
+*   `var>=value` -> **(Greater or Equal)** True if weight is greater or equal.
+*   `var<=value` -> **(Less or Equal)** True if weight is less or equal.
+
+**Examples:**
+```text
+# Ensure panties are only visible if the shot is full-body
+{if(shot==full body) | panties}
+
+# Only output if a variable's weight is emphasized (above 1.0)
+{if(lighting > 1.0) | (bloom:1.2) | }
+
+# Only output if a variable exists
+{if(?character_name) | 1girl, __^character_name__ | 1girl, generic face}
+
+# The else branch is executed if the condition fails
+{if(view~close-up) | detailed face | (detailed background:1.2)}
+```
+
+### Switch Statements
+For more complex branching based on a single variable, you can use the `switch(var)` statement. It checks the variable and executes the matching `case:`.
+
+```text
+{switch(view)
+  | close-up: (detailed face:1.2), portrait
+  | full-body: standing, shoes, full shot
+  | cowboy: cowboy shot, belt
+  | default: 
+      # The default branch executes if no cases match
+      {some|other|wildcard}
+}
+```
+
+> [!WARNING]
+> **Switch Case Limitation:** Because `switch` syntax relies on `:` as a delimiter (`| case: result`), it cannot safely match exact strings that contain unwrapped colons (e.g., `apple:, banana:`). The parser will incorrectly split the case at the first unwrapped colon it finds. If you need to match against a string containing colons, you should use an `if` statement instead: `{if(var==apple:, banana:) | result}`. Note that structural weights safely wrapped in parentheses like `(apple: 0.8)` will still parse perfectly in switch cases.
+
+*Note: The engine natively uses **Lazy Evaluation**. Unchosen branches are completely ignored, meaning any variables (`^var`) assigned inside an unchosen branch will safely NOT be executed.*
+
+> [!WARNING]
+> **Macro-Like Implementation & Lazy Evaluation Injection**
+> Unlike mainstream template systems (like Jinja) that build a complete Abstract Syntax Tree (AST), this engine uses a regex-based, macro-like string substitution mechanism. This means variables are resolved *before* conditional structures are parsed.
+> 
+> As a result, variables can "inject" logic:
+> 1. **Operator Injection:** If you write `{if({var})} | A | B}` and `{var}` resolves to `hello == there`, the condition literally becomes `hello == there` and evaluates accordingly.
+> 2. **Keyword Injection (NOT Possible):** Fortunately, writing `{ {var} | A | B }` where `{var}` resolves to `if(shot==full body)` will **NOT** inject a conditional block. The parser checks for the `if(...)` keyword *before* resolving wildcards on the choice string itself, so it acts safely as a standard roulette block.
+> 
+> Treat this as a powerful feature of lazy evaluation, but be careful not to accidentally inject operators (`==`, `>`, `~`) inside the `if(...)` parenthesis via wildcards if you do not intend to evaluate them as logic.
+
+### Execution Limits & Safety
+- **Inline Nesting (Max 12 Passes):** You can nest conditionals inline (e.g., `{if(A)|{if(B)|...}}`) up to roughly 12 passes deep. Exceeding this will leave any deeper brackets unresolved as raw text.
+- **File Recursion (Max 80 Depth):** If your conditional logic relies on wildcard files that recursively call other wildcard files with conditionals, execution is capped at a depth of 80 to prevent infinite loops.
+
+### Compatibility with Comments & Wildcards
+- **`## Comment Blocks ##`**: Conditional statements are fully supported inside comment blocks! Any variables assigned inside a successfully evaluated conditional branch within a comment block will be stored and preserved, even though the comment text itself is hidden from the final prompt.
+- **Wildcard Files**: You can absolutely use conditionals inside `.txt` wildcard files. However, because wildcard files are read **line-by-line**, your entire `{if(...)|...}` statement must be written on a single line. Multiline if-statements will break inside wildcards.
+
+### Reserved Syntax
+By introducing this feature, the following bracket syntaxes are now "reserved" by the engine:
+- `{if( ... ) | ... }`
+- `{switch( ... ) | ... }`
+
+If you genuinely want to generate the exact string `{if(apple) | yes | no}` in your prompt, these are now reserved words so the engine will always attempt to evaluate them as logic. If `apple` is undefined, the branch will evaluate to false and output `no`. Note that the condition parser expects strict syntax without spaces in the variable name (e.g., `if(my_var)` works, `if(my var)` does not and will fail gracefully, outputting raw text).
+
