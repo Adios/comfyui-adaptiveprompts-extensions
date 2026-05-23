@@ -2,6 +2,23 @@
 
 This is a companion extension node for `comfyui-adaptiveprompts` that adds advanced, experimental, or specific workflow-related features to the core engine.
 
+## 📦 Installation
+If you are not using ComfyUI Manager (or if the node is not yet available in the Manager's registry), you can install this extension manually:
+
+1. Open your terminal or command prompt.
+2. Navigate to your ComfyUI `custom_nodes` directory:
+   ```bash
+   cd ComfyUI/custom_nodes/
+   ```
+3. Clone this repository:
+   ```bash
+   git clone https://github.com/your-username/comfyui-adaptiveprompts-extensions.git
+   ```
+4. Restart ComfyUI.
+
+### Dependencies
+This extension strictly depends on the core **Adaptive Prompts** engine. You **MUST** have the official `comfyui-adaptiveprompts` node installed in your `custom_nodes` folder for this extension to function.
+
 ## Nodes Included
 
 ## 🥞 Prompt Stack Loader
