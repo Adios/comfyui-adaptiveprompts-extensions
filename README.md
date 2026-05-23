@@ -150,3 +150,9 @@ By introducing this feature, the following bracket syntaxes are now "reserved" b
 
 If you genuinely want to generate the exact string `{if(apple) | yes | no}` in your prompt, these are now reserved words so the engine will always attempt to evaluate them as logic. If `apple` is undefined, the branch will evaluate to false and output `no`. Note that the condition parser expects strict syntax without spaces in the variable name (e.g., `if(my_var)` works, `if(my var)` does not and will fail gracefully, outputting raw text).
 
+## 🧹 Variable Stripping Output
+This extension introduces a custom variable retrieval syntax to automatically run `PromptCleanup` rules on an output variable (such as replacing newlines with spaces).
+By appending `*` to your variable retrieval, the extension will retrieve it and strip formatting.
+Example: `__^my_variable*__`
+
+This is extremely useful when your variable was populated by a multi-line source, but you want to cleanly insert it into a single line output.

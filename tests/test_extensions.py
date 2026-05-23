@@ -25,6 +25,7 @@ syntax_extensions = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(syntax_extensions)
 
 PluginRegistry.register_bracket_handler(syntax_extensions.conditional_bracket_handler)
+PluginRegistry.register_wildcard_handler(syntax_extensions.wildcard_strip_handler)
 
 class TestGenerator(unittest.TestCase):
     def setUp(self):
