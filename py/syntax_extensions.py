@@ -221,3 +221,36 @@ def conditional_bracket_handler(content: str, seeded_rng, wildcard_dir, resolved
         return ""
         
     return None
+def wildcard_strip_handler(full_token: str, wc_name: str, var_tok: str, seeded_rng, wildcard_dir, resolved_vars: dict) -> str | None:
+    """
+    Hooks into wildcard parsing to intercept variables ending with *.
+    e.g. __^xxx*__ (wc_name=None, var_tok="xxx*")
+    """
+    target_var = None
+    
+    # We are looking for variables that end with *
+    if wc_name and wc_name.endswith("*"):
+        target_var = wc_name[:-1]
+    elif var_tok and var_tok.endswith("*"):
+        target_var = var_tok[:-1]
+        
+    if not target_var:
+        return None
+        
+    bucket = resolved_vars.get(target_var, {})
+    if not bucket:
+        return "" 
+        
+    # We get the requested value natively
+    value = list(bucket.values())[0]
+    
+    # Apply PromptCleanup logic (newlines -> space)
+    if PromptCleanup:
+        # PromptCleanup.process(string, cleanup_commas, cleanup_newlines, cleanup_whitespace, remove_lora_tags, fix_brackets)
+        value = PromptCleanup.process(value, True, "space", True, False, "([both])")[0]
+    else:
+        # Fallback if somehow not imported
+        value = value.replace("\n", " ").replace("\r", " ")
+        value = re.sub(r"\s+", " ", value).strip()
+        
+    return value
