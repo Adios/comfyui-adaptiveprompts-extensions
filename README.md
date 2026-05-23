@@ -68,6 +68,10 @@ Each line within a stack acts as an instruction. Alongside standard file paths, 
 - **`lora_string` (STRING):** A clean string containing all `<lora:name:weight>` tags found across all files in the stack, ready to be passed to a LoRA Tag Loader.
 
 ## 🔀 Conditional Branching & Logic
+
+> [!WARNING]
+> **Compatibility Limitation**: Conditional branching logic (`if`, `switch`) is exclusively supported when using the **Prompt Generator** or **Prompt Stack Loader** nodes. If you attempt to use conditionals inside the `PromptSequencer` or `PromptRepack` nodes, the core engine will forcefully split and break your logic blocks, resulting in malformed prompts. 
+
 You can now program logic directly into your prompts! Using lightweight condition operators, you can tell the engine to output specific text only if certain variables are set or match specific values. This is incredibly useful for avoiding prompt conflicts (e.g., ensuring "shoes" doesn't appear in a "close-up" portrait).
 
 > [!TIP]
