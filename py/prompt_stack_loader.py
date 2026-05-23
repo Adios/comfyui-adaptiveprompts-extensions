@@ -11,7 +11,19 @@ if adaptive_prompts_dir not in sys.path:
     sys.path.insert(0, adaptive_prompts_dir)
 
 try:
-    from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT, evaluate_prompt_core
+    from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT
+    try:
+        from py.generator import evaluate_prompt_core
+    except ImportError:
+        from py.generator import resolve_wildcards
+        def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
+            """Fallback implementation for older core versions (like the 'main' branch)."""
+            comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
+            for block in comment_blocks:
+                _ = resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
+            if hide_comments:
+                prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
+            return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 except ImportError:
     raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
 
