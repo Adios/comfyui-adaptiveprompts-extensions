@@ -6,6 +6,11 @@ adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "
 if adaptive_prompts_dir not in sys.path:
     sys.path.insert(0, adaptive_prompts_dir)
 
+try:
+    from py.plugin_registry import PluginRegistry
+except ImportError:
+    pass
+
 from .py.prompt_stack_loader import PromptStackLoader
 
 NODE_CLASS_MAPPINGS = {
