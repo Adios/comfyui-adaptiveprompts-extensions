@@ -1,6 +1,6 @@
 # Adaptive Prompts Extensions
 
-This is a companion extension node for `comfyui-adaptiveprompts` that adds advanced, experimental, or specific workflow-related features to the core engine.
+This is a companion extension node for [comfyui-adaptiveprompts](https://github.com/Alectriciti/comfyui-adaptiveprompts) that adds advanced, experimental, or specific workflow-related features to the core engine.
 
 ## 📦 Installation
 If you are not using ComfyUI Manager (or if the node is not yet available in the Manager's registry), you can install this extension manually:
@@ -17,7 +17,7 @@ If you are not using ComfyUI Manager (or if the node is not yet available in the
 4. Restart ComfyUI.
 
 ### Dependencies
-This extension strictly depends on the core **Adaptive Prompts** engine. You **MUST** have the official `comfyui-adaptiveprompts` node installed in your `custom_nodes` folder for this extension to function.
+This extension strictly depends on the core **Adaptive Prompts** engine. You **MUST** have the official [comfyui-adaptiveprompts](https://github.com/Alectriciti/comfyui-adaptiveprompts) node installed in your `custom_nodes` folder for this extension to function.
 
 ## Nodes Included
 
@@ -66,4 +66,8 @@ Each line within a stack acts as an instruction. Alongside standard file paths, 
 - **`prompt` (STRING):** The fully evaluated, comma-separated string containing all the text and resolved wildcards from the processed files, with LoRA tags stripped out.
 - **`context` (DICT):** The accumulated dictionary of variables created during the evaluation of the stack. This can be passed to a Prompt Generator or another Stack Loader.
 - **`lora_string` (STRING):** A clean string containing all `<lora:name:weight>` tags found across all files in the stack, ready to be passed to a LoRA Tag Loader.
+
+## 🙏 Acknowledgments
+
+A special thank you to **[Alectriciti](https://github.com/Alectriciti/comfyui-adaptiveprompts)** for bringing us so many nice building blocks!
 
