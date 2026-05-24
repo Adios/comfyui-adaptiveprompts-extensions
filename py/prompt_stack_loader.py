@@ -5,25 +5,48 @@ from typing import List
 import sys
 
 # Ensure comfyui-adaptiveprompts is available
+generator_mod = None
+for mod_name, mod in list(sys.modules.items()):
+    if mod_name.endswith(".py.generator") and "adaptiveprompt" in mod_name.lower():
+        if hasattr(mod, "SeededRandom"):
+            generator_mod = mod
+            break
 
-adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfyui-adaptiveprompts"))
-if adaptive_prompts_dir not in sys.path:
-    sys.path.insert(0, adaptive_prompts_dir)
-
-try:
+if generator_mod is not None:
+    SeededRandom = generator_mod.SeededRandom
+    DEFAULT_WILDCARD_ROOT = generator_mod.DEFAULT_WILDCARD_ROOT
+else:
+    # Fallback to sys.path import
+    adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfyui-adaptiveprompts"))
+    if adaptive_prompts_dir not in sys.path:
+        sys.path.insert(0, adaptive_prompts_dir)
     from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT
-    try:
-        from py.generator import evaluate_prompt_core
-    except ImportError:
-        from py.generator import resolve_wildcards
-        def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
-            """Fallback implementation for older core versions (like the 'main' branch)."""
-            comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
-            for block in comment_blocks:
-                _ = resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
-            if hide_comments:
-                prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
-            return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
+try:
+    if generator_mod is not None:
+        try:
+            evaluate_prompt_core = generator_mod.evaluate_prompt_core
+        except AttributeError:
+            resolve_wildcards = generator_mod.resolve_wildcards
+            def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
+                comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
+                for block in comment_blocks:
+                    _ = resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
+                if hide_comments:
+                    prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
+                return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
+    else:
+        try:
+            from py.generator import evaluate_prompt_core
+        except ImportError:
+            from py.generator import resolve_wildcards
+            def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
+                """Fallback implementation for older core versions (like the 'main' branch)."""
+                comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
+                for block in comment_blocks:
+                    _ = resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
+                if hide_comments:
+                    prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
+                return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 except ImportError:
     raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
 
