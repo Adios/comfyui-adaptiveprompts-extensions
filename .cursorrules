@@ -43,5 +43,10 @@ sys.modules["py"].__path__ = [
 ]
 ```
 
-## 4. Path Traversal Security
-When dealing with `PromptStackLoader` or file paths (like `base_dir` and `stack_file`), always utilize the built-in `_is_safe_path` utility. Absolute paths are explicitly disabled to prevent directory traversal vulnerabilities. Keep stack paths relative.
+## 4. Path Traversal & Security Sandbox
+When working on `py/prompt_stack_loader.py`, you must strictly adhere to the established directory traversal sandboxing rules:
+1. **`base_dir`**: Must never escape the extension root (`node_root`). It establishes the sandbox for all content files.
+2. **`inline_stack` & Stack Lines**: Paths written *inside* the stack file or inline text area MUST be sandboxed against the `base_dir`. They cannot escape `base_dir`.
+3. **`stack_file` (Exception)**: The `stack_file` path itself is an orchestrator file. It **IS** allowed to use `../` to escape the `base_dir` (e.g., to access a sibling `stacks/` folder), provided it does NOT escape the overall `node_root`.
+
+Always use `_is_safe_path()` to validate paths before reading or verifying files, as it natively resolves symlinks and prevents absolute path injection.

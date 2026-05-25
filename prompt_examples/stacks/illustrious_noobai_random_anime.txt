@@ -9,8 +9,12 @@
 # - Mac/Windows friendly: Don't worry about slashes (\ or /), both work perfectly.
 #
 # HOW PATHS WORK:
-# - Paths can be absolute (e.g., C:/my_files/prompt.txt) or relative.
-# - Relative paths start from your defined 'base_dir'. 
+# - Paths must be relative (absolute paths like C:\ or /etc/ are blocked).
+# - You cannot use ../ to escape your 'base_dir' for these internal lines.
+#   - Allowed: subfolder/../file.txt (stays inside base_dir)
+#   - Blocked: ../../file.txt (escapes base_dir)
+#   - (Note: the 'stack_file' input on the node itself CAN escape base_dir).
+# - External symlinks are blocked, and max file size is 5MB.
 #
 # COMMAND CHEAT SHEET:
 # #               -> Adds a comment. The system ignores these lines completely.
