@@ -128,6 +128,58 @@ class PromptStackLoader:
                 }),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
+        import hashlib
+        import os
+        m = hashlib.sha256()
+        
+        resolved_base_dir = base_dir.strip()
+        if not resolved_base_dir:
+            resolved_base_dir = DEFAULT_PROMPT_ROOT
+        elif not os.path.isabs(resolved_base_dir):
+            node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            resolved_base_dir = os.path.normpath(os.path.join(node_root, resolved_base_dir))
+
+        paths = []
+        if stack_file:
+            stack_path = stack_file
+            if not os.path.isabs(stack_path) and resolved_base_dir:
+                stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_path))
+            if os.path.exists(stack_path):
+                m.update(str(os.path.getmtime(stack_path)).encode("utf-8"))
+                try:
+                    with open(stack_path, "r", encoding="utf-8") as f:
+                        paths.extend(f.readlines())
+                except OSError:
+                    pass
+        if inline_stack:
+            paths.extend(inline_stack.splitlines())
+            
+        for line in paths:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("remove:") or line.startswith("replace:"):
+                continue
+            is_random = line.startswith("random:")
+            path_str = line[len("random:"):].strip() if is_random else line
+            
+            resolved_path = path_str
+            if not os.path.isabs(resolved_path):
+                resolved_path = os.path.normpath(os.path.join(resolved_base_dir, resolved_path))
+                
+            if os.path.exists(resolved_path):
+                m.update(str(os.path.getmtime(resolved_path)).encode("utf-8"))
+                if os.path.isdir(resolved_path):
+                    for root, _, files in os.walk(resolved_path):
+                        for file in files:
+                            if file.endswith(".txt"):
+                                try:
+                                    fpath = os.path.join(root, file)
+                                    m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
+                                except OSError:
+                                    pass
+        return m.hexdigest()
         
     RETURN_TYPES = ("STRING", "DICT", "STRING")
     RETURN_NAMES = ("prompt", "context", "lora_string")
