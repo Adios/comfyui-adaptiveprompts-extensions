@@ -86,3 +86,13 @@ In a multi-scene workflow, you can chain multiple Stack Loaders together. For ex
 4.  Set `override_context` to **Override**.
 
 This recalculates the expression variable while keeping the rest of your scene's variables strictly identical. Note that since LoRA tags are always accumulated and ignore the **Override** toggle, you would use the `remove:file_path` command in the `inline_stack` if you need to pull out a LoRA during a re-roll.
+
+### 7. Security Sandboxing
+To protect against malicious stack definitions, the **Prompt Stack Loader** enforces several strict security measures:
+*   **No Absolute Paths:** Paths must always be relative to the `base_dir`.
+*   **Directory Traversal Blocking:** You cannot use `../` to escape your `base_dir` when defining internal stack lines. 
+    - *Allowed:* `subfolder/../file.txt` (Stays inside `base_dir`)
+    - *Blocked:* `../../secrets.txt` (Escapes `base_dir`)
+    - *(Exception: The main `stack_file` input on the node itself is allowed to escape `base_dir` as long as it stays inside the extension root).*
+*   **Symlink Sandboxing:** Symlinks that point to files or directories outside the allowed `base_dir` are automatically disabled.
+*   **Size Limits:** To prevent memory exhaustion, files larger than 5MB are skipped.

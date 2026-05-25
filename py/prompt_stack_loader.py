@@ -3,12 +3,14 @@ import re
 import glob
 from typing import List
 import sys
-
-# Ensure comfyui-adaptiveprompts is available
+import importlib.util
 
 adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfyui-adaptiveprompts"))
+
+added_to_sys_path = False
 if adaptive_prompts_dir not in sys.path:
     sys.path.insert(0, adaptive_prompts_dir)
+    added_to_sys_path = True
 
 try:
     from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT
@@ -26,8 +28,27 @@ try:
             return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 except ImportError:
     raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
+finally:
+    if added_to_sys_path:
+        sys.path.remove(adaptive_prompts_dir)
 
 # --- Context Helper Functions ---
+def _is_safe_path(base: str, path: str) -> bool:
+    """
+    Validates that `path` is securely contained within `base`.
+    
+    This function prevents path traversal (e.g., using `../../`) and arbitrary file 
+    read vulnerabilities. It fully resolves all symlinks via `os.path.realpath` 
+    to ensure that symlink-based evasion attacks cannot escape the sandbox boundary.
+    It returns True if the path is safe, and False if it attempts to escape.
+    """
+    try:
+        real_base = os.path.realpath(base)
+        real_path = os.path.realpath(path)
+        return os.path.commonpath([real_base, real_path]) == real_base
+    except ValueError:
+        return False
+
 def _ensure_bucket_dict(bucket_like):
     if bucket_like is None:
         return {}
@@ -93,16 +114,16 @@ class PromptStackLoader:
             "required": {
                 "base_dir": ("STRING", {
                     "default": "",
-                    "tooltip": "The root directory for your stack. Absolute paths work. Relative paths anchor to this custom node's root directory. Leave empty to default to the 'prompts' folder."
+                    "tooltip": "The root directory for your stack. Relative paths anchor to this custom node's root directory. Leave empty to default to the 'prompts' folder."
                 }),
                 "stack_file": ("STRING", {
                     "default": "",
-                    "tooltip": "Optional. Path to a .txt file containing your stack. Absolute paths work. Relative paths (e.g., 'stacks/my_stack.txt') resolve against base_dir."
+                    "tooltip": "Optional. Path to a .txt file containing your stack. Relative paths (e.g., 'stacks/my_stack.txt') resolve against base_dir."
                 }),
                 "inline_stack": ("STRING", {
                     "multiline": True, 
                     "default": "",
-                    "tooltip": "List of text paths to load sequentially (absolute paths work, relative resolve against base_dir).\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
+                    "tooltip": "List of text paths to load sequentially (relative resolve against base_dir).\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
                 }),
                 "override_context": ("BOOLEAN", {
                     "default": False, 
@@ -123,6 +144,75 @@ class PromptStackLoader:
                 }),
             },
         }
+
+    @classmethod
+    def _resolve_base_dir(cls, base_dir: str) -> str:
+        """
+        Resolves the user's `base_dir` input into an absolute path and validates it.
+        
+        Security: The `base_dir` establishes the foundational sandbox for all internal 
+        stack lines (e.g., character traits or replacements). It is strictly validated 
+        to ensure it does not escape the overall extension folder (`node_root`).
+        If it fails the security check, it safely defaults to the 'prompts' folder.
+        """
+        resolved_base_dir = base_dir.strip()
+        node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if not resolved_base_dir:
+            resolved_base_dir = os.path.join(node_root, "prompts")
+        else:
+            resolved_base_dir = os.path.normpath(os.path.join(node_root, resolved_base_dir))
+            
+        if not _is_safe_path(node_root, resolved_base_dir):
+            print(f"[Adaptive Prompts] Security Warning: base_dir '{base_dir}' attempts path traversal. Defaulting to 'prompts'.")
+            resolved_base_dir = os.path.join(node_root, "prompts")
+        return resolved_base_dir
+
+    @classmethod
+    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
+        import hashlib
+        import os
+        m = hashlib.sha256()
+        
+        resolved_base_dir = cls._resolve_base_dir(base_dir)
+        node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        paths = []
+        if stack_file:
+            stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_file))
+            if _is_safe_path(node_root, stack_path) and os.path.exists(stack_path):
+                m.update(str(os.path.getmtime(stack_path)).encode("utf-8"))
+                try:
+                    if os.path.getsize(stack_path) > 5 * 1024 * 1024:
+                        print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping read in IS_CHANGED.")
+                    else:
+                        with open(stack_path, "r", encoding="utf-8") as f:
+                            paths.extend(f.readlines())
+                except OSError:
+                    pass
+        if inline_stack:
+            paths.extend(inline_stack.splitlines())
+            
+        for line in paths:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("remove:") or line.startswith("replace:"):
+                continue
+            is_random = line.startswith("random:")
+            path_str = line[len("random:"):].strip() if is_random else line
+            
+            resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
+            
+            if _is_safe_path(resolved_base_dir, resolved_path) and os.path.exists(resolved_path):
+                m.update(str(os.path.getmtime(resolved_path)).encode("utf-8"))
+                if os.path.isdir(resolved_path):
+                    for root, _, files in os.walk(resolved_path):
+                        for file in files:
+                            if file.endswith(".txt"):
+                                try:
+                                    fpath = os.path.join(root, file)
+                                    m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
+                                except OSError:
+                                    pass
+        return m.hexdigest()
         
     RETURN_TYPES = ("STRING", "DICT", "STRING")
     RETURN_NAMES = ("prompt", "context", "lora_string")
@@ -130,17 +220,33 @@ class PromptStackLoader:
     CATEGORY = "adaptiveprompts/generation"
 
     def _resolve_paths(self, base_dir: str, stack_file: str, inline_stack: str) -> List[str]:
+        """
+        Resolves and loads the contents of the `stack_file` and `inline_stack`.
+        
+        Security Exception: The `stack_file` itself acts as an orchestrator and may 
+        legitimately live outside the `base_dir` (e.g., in a sibling 'stacks' folder). 
+        Therefore, `stack_file` is sandboxed against the broader `node_root` (the 
+        extension directory), NOT the `base_dir`. 
+        
+        However, the internal lines parsed *from* the stack file remain strictly 
+        sandboxed against the `base_dir` during the final file resolution phase.
+        """
         paths = []
         if stack_file:
             # Use the variable 'stack_path' for stack configuration files
-            stack_path = stack_file
-            if not os.path.isabs(stack_path) and base_dir:
-                stack_path = os.path.normpath(os.path.join(base_dir, stack_path))
-            try:
-                with open(stack_path, "r", encoding="utf-8") as f:
-                    paths.extend(f.readlines())
-            except OSError as e:
-                print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
+            stack_path = os.path.normpath(os.path.join(base_dir, stack_file))
+            node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            if not _is_safe_path(node_root, stack_path):
+                print(f"[Adaptive Prompts] Security Warning: stack_file '{stack_file}' attempts path traversal. Skipping.")
+            else:
+                try:
+                    if os.path.getsize(stack_path) > 5 * 1024 * 1024:
+                        print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping.")
+                    else:
+                        with open(stack_path, "r", encoding="utf-8") as f:
+                            paths.extend(f.readlines())
+                except OSError as e:
+                    print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
 
         if inline_stack:
             paths.extend(inline_stack.splitlines())
@@ -148,7 +254,11 @@ class PromptStackLoader:
         return paths
 
     def _get_random_file(self, dir_path: str, rng: SeededRandom) -> str:
-        candidates = glob.glob(os.path.join(dir_path, "**", "*.txt"), recursive=True)
+        candidates = []
+        for root, _, files in os.walk(dir_path):
+            for file in files:
+                if file.endswith(".txt"):
+                    candidates.append(os.path.join(root, file))
         if candidates:
             candidates.sort() # Ensure deterministic order across different OSs
             return rng.choice(candidates)
@@ -225,9 +335,10 @@ class PromptStackLoader:
             is_random = line.startswith("random:")
             path_str = line[len("random:"):].strip() if is_random else line
             
-            resolved_path = path_str
-            if not os.path.isabs(resolved_path):
-                resolved_path = os.path.normpath(os.path.join(resolved_base_dir, resolved_path))
+            resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
+            if not _is_safe_path(resolved_base_dir, resolved_path):
+                print(f"[Adaptive Prompts] Security Warning: path '{path_str}' attempts path traversal. Skipping.")
+                continue
                 
             if is_random and os.path.isdir(resolved_path):
                 chosen_file = self._get_random_file(resolved_path, rng)
@@ -244,6 +355,9 @@ class PromptStackLoader:
     def _process_single_file(self, filepath: str, current_context: dict, rng: SeededRandom, override_context: bool) -> tuple[str, List[str]]:
         lora_regex = re.compile(r"<lora:[^>]+>")
         try:
+            if os.path.getsize(filepath) > 5 * 1024 * 1024:
+                print(f"[Adaptive Prompts] Warning: File '{filepath}' exceeds 5MB limit. Skipping.")
+                return "", []
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
         except OSError as e:
@@ -281,14 +395,7 @@ class PromptStackLoader:
     def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None):
         rng = SeededRandom(seed)
         
-        resolved_base_dir = base_dir.strip()
-        if not resolved_base_dir:
-            resolved_base_dir = DEFAULT_PROMPT_ROOT
-        elif not os.path.isabs(resolved_base_dir):
-            # Anchor relative base_dir to the custom node's root directory.
-            # This allows portable paths like "prompts/arch" to resolve properly.
-            node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            resolved_base_dir = os.path.normpath(os.path.join(node_root, resolved_base_dir))
+        resolved_base_dir = self._resolve_base_dir(base_dir)
             
         raw_lines = self._resolve_paths(resolved_base_dir, stack_file, inline_stack)
         files_to_process = self._build_final_file_list(raw_lines, resolved_base_dir, rng)
