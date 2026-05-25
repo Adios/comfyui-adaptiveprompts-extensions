@@ -3,12 +3,14 @@ import re
 import glob
 from typing import List
 import sys
-
-# Ensure comfyui-adaptiveprompts is available
+import importlib.util
 
 adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfyui-adaptiveprompts"))
+
+added_to_sys_path = False
 if adaptive_prompts_dir not in sys.path:
     sys.path.insert(0, adaptive_prompts_dir)
+    added_to_sys_path = True
 
 try:
     from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT
@@ -26,6 +28,9 @@ try:
             return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 except ImportError:
     raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
+finally:
+    if added_to_sys_path:
+        sys.path.remove(adaptive_prompts_dir)
 
 # --- Context Helper Functions ---
 def _ensure_bucket_dict(bucket_like):

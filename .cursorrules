@@ -1,0 +1,47 @@
+# ComfyUI Adaptive Prompts Extension - Agent Rules
+
+This file contains critical architectural rules and context for AI agents (Cursor, Cline, Windsurf, Antigravity, etc.) working on this repository. Please read carefully before suggesting or making changes.
+
+## 1. Project Context
+This project (`comfyui-adaptiveprompts-extensions`) is an extension of a "mother project" (`comfyui-adaptiveprompts`). Both are ComfyUI Custom Nodes.
+- **Mother Project Path**: Expected to be found at `../comfyui-adaptiveprompts` relative to this node.
+- **Goal**: Maintain compatibility layers and extend the functionality of the mother project without breaking its internal assumptions.
+
+## 2. The `py/` Namespace (CRITICAL DO NOT MODIFY)
+**RULE:** NEVER create an `__init__.py` file inside the `py/` directory!
+
+### Why?
+Both this extension and the mother project store their backend logic in a folder named `py/`. Because neither folder contains an `__init__.py` file, Python 3 treats them as **Implicit Namespace Packages** (PEP 420). This allows Python to logically "merge" the contents of both `py/` folders into a single shared namespace at runtime.
+
+If you add an `__init__.py` to this project's `py/` folder, it becomes a **Regular Package**. Regular packages do not merge. If this happens, when our code runs `from py.generator import SeededRandom` (which lives in the mother project), Python will exclusively search our `py/` folder, fail to find `generator.py`, and crash. 
+
+## 3. Pytest and the `py` Module Collision
+If you are writing or debugging tests, be aware of a known collision with `pytest`.
+
+### The Problem
+`pytest` depends on (or bundles) an internal legacy library which installs a single file named `py.py`. Because regular modules (`py.py`) take precedence over namespace packages (`py/` folders), running `pytest` natively causes Python to load `py.py` into `sys.modules`. 
+This immediately breaks imports like `from py.prompt_stack_loader` or `from py.generator` with the error:
+`ModuleNotFoundError: No module named 'py.X'; 'py' is not a package`.
+
+### The Solution (Already Implemented)
+Do not attempt to fix this by adding `__init__.py` to `py/` (see Rule 2) or by using `importlib` hacks that break relative imports inside the mother project.
+
+Instead, test files (e.g., `tests/test_cache.py`) must manually patch `sys.modules["py"]` at the very top of the file to force it to act as a combined namespace package:
+```python
+import sys
+import types
+import os
+
+node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+adaptive_prompts_dir = os.path.abspath(os.path.join(node_root, "..", "comfyui-adaptiveprompts"))
+
+# Mock the 'py' package to include both our extension's py/ and the mother project's py/.
+sys.modules["py"] = types.ModuleType("py")
+sys.modules["py"].__path__ = [
+    os.path.join(node_root, "py"),
+    os.path.join(adaptive_prompts_dir, "py")
+]
+```
+
+## 4. Path Traversal Security
+When dealing with `PromptStackLoader` or file paths (like `base_dir` and `stack_file`), always utilize the built-in `_is_safe_path` utility. Absolute paths are explicitly disabled to prevent directory traversal vulnerabilities. Keep stack paths relative.
