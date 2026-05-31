@@ -63,6 +63,36 @@ Each line within a stack acts as an instruction. Alongside standard file paths, 
 - `replace:old_file|new_file` -> Swaps a file in-place, allowing targeted modifications without editing the original stack file. 
   - e.g., `replace:lighting/sunny.txt|lighting/rainy.txt` or `replace:random:anime|anime/frieren/frieren.txt`.
 
+### 🔀 Stack-Level Conditional Branching (`ps_switch`)
+
+The Prompt Stack Loader includes a built-in pre-processor macro for conditional branching across files. This is extremely useful when an action or clothing choice needs to adapt perfectly to a background scene you loaded earlier in the stack.
+
+For example, imagine a global stack that first loads a specific background scene:
+`backgrounds/scenes/vehicle_interior/ferris_wheel_cabin_01.txt`
+This file sets the background details, and defines a scene variable:
+`{ferris wheel}^scene`
+
+Later in the same stack (or in a separate downstream Stack Loader), you load an action file, for example, `actions/leisure/looking_out.txt`. Because the scene variable was established upstream, you can use the `ps_switch(var)` macro to contextually adapt the pose:
+
+```text
+{
+  dynamic pose,
+  {ps_switch(scene)
+    | ferris wheel: pressing hands against glass, looking down at the city
+    | swimming pool | beach: splashing water, looking at the horizon
+    | default: looking into the distance
+  }
+}^action
+```
+
+**How it works:**
+*   **Contextual Matching:** The `PromptStackLoader` checks its accumulated context for the variable `scene`. If it finds `ferris wheel`, it swaps the entire `ps_switch` block with `pressing hands against glass, looking down at the city`.
+*   **Shared Results (Fallthrough):** You can share a single result across multiple cases by separating them with pipes (e.g., `| swimming pool | beach: splashing water`).
+*   **Default Fallback:** If the variable resolves to something else, or isn't defined at all, it outputs the `default:` branch.
+*   **Safe "Pass-Through":** If the variable `scene` is completely missing from the upstream context, the macro safely resolves to the `default:` fallback (or an empty string if no default is provided) to prevent syntax errors.
+
+> **Note:** Because `ps_switch` runs as a stack-level macro *before* core prompt evaluation, it relies entirely on variables defined in *previous* files in the stack. If you assign a variable and attempt to switch on it within the **exact same file**, it will use the old upstream value instead.
+
 ### Node Outputs
 
 - **`prompt` (STRING):** The fully evaluated, comma-separated string containing all the text and resolved wildcards from the processed files, with LoRA tags stripped out.

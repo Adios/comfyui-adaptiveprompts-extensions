@@ -352,6 +352,121 @@ class PromptStackLoader:
                     
         return files_to_process
 
+    def _resolve_switch_macros(self, text: str, context: dict) -> str:
+        def split_pipes(s):
+            parts, curr = [], []
+            paren_depth = brace_depth = bracket_depth = 0
+            for c in s:
+                if c == '(': paren_depth += 1
+                elif c == ')': paren_depth -= 1
+                elif c == '{': brace_depth += 1
+                elif c == '}': brace_depth -= 1
+                elif c == '[': bracket_depth += 1
+                elif c == ']': bracket_depth -= 1
+                elif c == '|' and paren_depth == 0 and brace_depth == 0 and bracket_depth == 0:
+                    parts.append("".join(curr))
+                    curr = []
+                    continue
+                curr.append(c)
+            parts.append("".join(curr))
+            return parts
+
+        def split_case(s):
+            paren_depth = brace_depth = bracket_depth = 0
+            for i, c in enumerate(s):
+                if c == '(': paren_depth += 1
+                elif c == ')': paren_depth -= 1
+                elif c == '{': brace_depth += 1
+                elif c == '}': brace_depth -= 1
+                elif c == '[': bracket_depth += 1
+                elif c == ']': bracket_depth -= 1
+                elif c == ':' and paren_depth == 0 and brace_depth == 0 and bracket_depth == 0:
+                    return s[:i], s[i+1:]
+            return s, None
+
+        out = []
+        idx = 0
+        while idx < len(text):
+            start = text.find("{ps_switch(", idx)
+            if start == -1:
+                out.append(text[idx:])
+                break
+                
+            out.append(text[idx:start])
+            
+            brace_count = 0
+            end = -1
+            for i in range(start, len(text)):
+                if text[i] == '{': brace_count += 1
+                elif text[i] == '}': 
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end = i
+                        break
+                        
+            if end == -1:
+                out.append(text[start:start+11])
+                idx = start + 11
+                continue
+                
+            block = text[start+1:end]
+            choices = split_pipes(block)
+            first_choice = choices[0].strip()
+            
+            m = re.match(r"^ps_switch\s*\((.*?)\)$", first_choice, re.DOTALL)
+            if not m:
+                out.append(text[start:end+1])
+                idx = end + 1
+                continue
+                
+            var_name = m.group(1).strip()
+            var_values = [str(v).strip() for v in context.get(var_name, {}).values()]
+            
+            matched_res = ""
+            default_res = ""
+            has_default = False
+            
+            accumulated_cases = []
+            default_pending = False
+
+            for choice in choices[1:]:
+                case_val, res_val = split_case(choice)
+                if res_val is None:
+                    # Fallthrough case: e.g. "a" in "| a | b: result"
+                    case_val_stripped = case_val.strip()
+                    if case_val_stripped == "default":
+                        default_pending = True
+                    else:
+                        accumulated_cases.append(case_val_stripped)
+                else:
+                    case_val = case_val.strip()
+                    if case_val == "default":
+                        default_res = res_val
+                        has_default = True
+                        accumulated_cases = [] # Prevent leapfrog leakage
+                        default_pending = False
+                    else:
+                        accumulated_cases.append(case_val)
+                        if any(k in var_values for k in accumulated_cases):
+                            matched_res = res_val
+                            break
+                        
+                        if default_pending:
+                            default_res = res_val
+                            has_default = True
+                            default_pending = False
+                            
+                        accumulated_cases = [] # Reset after a result block
+            
+            final_res = matched_res if matched_res else (default_res if has_default else "")
+            if "{ps_switch(" in final_res:
+                final_res = self._resolve_switch_macros(final_res, context)
+                
+            out.append(final_res)
+            idx = end + 1
+
+        return "".join(out)
+
     def _process_single_file(self, filepath: str, current_context: dict, rng: SeededRandom, override_context: bool) -> tuple[str, List[str]]:
         lora_regex = re.compile(r"<lora:[^>]+>")
         try:
@@ -367,6 +482,9 @@ class PromptStackLoader:
         # Extract LoRA tags directly from raw string
         found_loras = lora_regex.findall(content)
         cleaned_content = lora_regex.sub("", content)
+
+        # Apply switch macros
+        cleaned_content = self._resolve_switch_macros(cleaned_content, current_context)
 
         snapshot = {}
         if override_context:
