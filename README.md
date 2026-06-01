@@ -136,10 +136,10 @@ Because Node 1 passes the `mode` variable downstream, any random character picke
 ```text
 # frieren.txt
 
-{ps_switch(mode)
-  | explicit: {revealing white dress, collarbone}
-  | default: {classic white dress, winter coat}
-}^outfit
+{{ps_switch(mode)
+  | explicit: revealing white dress, collarbone
+  | default: classic white dress, winter coat
+}}^outfit
 ```
 
 This architecture keeps your prompt files highly modular, ensures `random:` selection remains powerful without breaking, and completely eliminates the need for messy override scripts or folder structures.
