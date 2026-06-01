@@ -19,20 +19,22 @@ If you are not using ComfyUI Manager (or if the node is not yet available in the
 ### Dependencies
 This extension strictly depends on the core **Adaptive Prompts** engine. You **MUST** have the official [comfyui-adaptiveprompts](https://github.com/Alectriciti/comfyui-adaptiveprompts) node installed in your `custom_nodes` folder for this extension to function.
 
-## Nodes Included
+---
 
-## 🥞 Prompt Stack Loader
+## 🧩 Nodes Included
+
+### 🥞 Prompt Stack Loader
 <img src="images/prompt_stack_loader.png"/>
 
 The **Prompt Stack Loader** is a powerful node designed to sequentially load, parse, and evaluate a stack of text files. Instead of constructing unwieldy monolithic prompt strings, it serves as an orchestrator for **modular prompt configurations** where your logic is distributed across multiple files.
 
-### Why Use a Stack Loader?
+#### Why Use a Stack Loader?
 By leveraging this node, you can transition your workflow into a highly adaptable **profile-based system**:
 *   **Rapid Context Switching:** Easily switch between different subjects by changing a single line in your stack, automatically pulling in their associated LoRAs and custom styling.
 *   **Dynamic Adaptation:** Your main Prompt Generator template dynamically adapts to the current subject, making the process seamless.
 *   **Scalability:** The system is designed around a production-ready **Subject Hook Architecture**, allowing you to build complex, highly-detailed prompts cleanly and modularly. 
 
-### Key Features
+#### Key Features
 *   **Sequential File Processing:** Load and evaluate a list of text files (a "stack") in order. File paths can be relative or specifically pull a random file from a directory.
 *   **Dynamic Stack Modifiers:** Use inline commands like `remove:path/to/file.txt` or `replace:old_path|new_path` to surgically alter a master stack template without changing the underlying files.
 *   **Hidden Files & Local Overrides:** Any file or directory starting with `_` or `.` is completely hidden from the randomizer. This allows you to safely store specialized states or drafts (e.g., `_explicit_override.txt`) alongside your main prompts, loading them only when you explicitly ask for them!
@@ -43,7 +45,7 @@ For a deeper dive into the **Architecture Philosophy** and ready-to-use template
 
 A ready-to-use example workflow is also available: **[Prompt Stack Loader Three Scenes Pipeline](workflow/PromptStackLoaderThreeScenesPipeline.json)**.
 
-### Node Parameters & Stack Syntax
+#### Node Parameters & Stack Syntax
 
 - **`base_dir`**: The foundational directory for resolving file paths.
   - **Empty:** Resolves to the `prompts` directory within this extension's folder.
@@ -67,7 +69,15 @@ Each line within a stack acts as an instruction. Alongside standard file paths, 
 **Local Overrides & Hidden Files:**
 A powerful workflow technique is to prefix files or directories with `_` or `.` (e.g., `_action_pose.txt` or `_WIP`). Because these are ignored by the randomizer, they won't randomly appear in your generations. However, you can still load them *explicitly* by writing their exact path in your stack (e.g., `anime/neon_genesis_evangelion/_asuka_override.txt`). This makes managing complex "Context Override" modes much cleaner, as your base options and their specific overrides can live safely in the exact same directory without interfering with each other.
 
-### 🔀 Stack-Level Conditional Branching (`ps_switch`)
+#### Node Outputs
+
+- **`prompt` (STRING):** The fully evaluated, comma-separated string containing all the text and resolved wildcards from the processed files, with LoRA tags stripped out.
+- **`context` (DICT):** The accumulated dictionary of variables created during the evaluation of the stack. This can be passed to a Prompt Generator or another Stack Loader.
+- **`lora_string` (STRING):** A clean string containing all `<lora:name:weight>` tags found across all files in the stack, ready to be passed to a LoRA Tag Loader.
+
+---
+
+## 🔀 Advanced Macros: `ps_switch`
 
 The Prompt Stack Loader includes a built-in pre-processor macro for conditional branching across files. This is extremely useful when an action or clothing choice needs to adapt perfectly to a background scene you loaded earlier in the stack.
 
@@ -97,13 +107,45 @@ Later in the same stack (or in a separate downstream Stack Loader), you load an 
 
 > **Note:** Because `ps_switch` runs as a stack-level macro *before* core prompt evaluation, it relies entirely on variables defined in *previous* files in the stack. If you assign a variable and attempt to switch on it within the **exact same file**, it will use the old upstream value instead.
 
-### Node Outputs
+---
 
-- **`prompt` (STRING):** The fully evaluated, comma-separated string containing all the text and resolved wildcards from the processed files, with LoRA tags stripped out.
-- **`context` (DICT):** The accumulated dictionary of variables created during the evaluation of the stack. This can be passed to a Prompt Generator or another Stack Loader.
-- **`lora_string` (STRING):** A clean string containing all `<lora:name:weight>` tags found across all files in the stack, ready to be passed to a LoRA Tag Loader.
+## 💡 Pro Tips & Advanced Workflows
+
+### 🔗 Chained Loaders & Global States
+
+The true power of the `PromptStackLoader` shines when chaining multiple nodes together via the `context` ports. This gracefully bypasses `base_dir` path restrictions and allows you to establish global states (like SFW/explicit modes, weather, or time of day) that dynamically control downstream subjects—even when those subjects are selected randomly!
+
+By pairing chained loaders with the `ps_switch` macro, you can encapsulate all character variations directly inside their own files, allowing upstream loaders to dictate their state.
+
+**Example: Global Modifiers with Random Subjects**
+
+```text
+[ Node 1: Global State ]
+base_dir: prompts/vars
+inline_stack: mode_explicit.txt (contains: {explicit}^mode)
+         |
+    (context out)
+         |
+[ Node 2: Subject Generator ]
+base_dir: prompts/anime
+inline_stack: random:characters
+```
+
+Because Node 1 passes the `mode` variable downstream, any random character picked by Node 2 (e.g., `characters/frieren.txt`) instantly reacts to the global state:
+
+```text
+# frieren.txt
+
+{ps_switch(mode)
+  | explicit: {revealing white dress, collarbone}
+  | default: {classic white dress, winter coat}
+}^outfit
+```
+
+This architecture keeps your prompt files highly modular, ensures `random:` selection remains powerful without breaking, and completely eliminates the need for messy override scripts or folder structures.
+
+---
 
 ## 🙏 Acknowledgments
 
 A special thank you to **[Alectriciti](https://github.com/Alectriciti/comfyui-adaptiveprompts)** for bringing us so many nice building blocks!
-
