@@ -202,11 +202,15 @@ class PromptStackLoader:
             resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
             
             if _is_safe_path(resolved_base_dir, resolved_path) and os.path.exists(resolved_path):
-                m.update(str(os.path.getmtime(resolved_path)).encode("utf-8"))
-                if os.path.isdir(resolved_path):
-                    for root, _, files in os.walk(resolved_path):
+                if not os.path.isdir(resolved_path):
+                    m.update(str(os.path.getmtime(resolved_path)).encode("utf-8"))
+                else:
+                    for root, dirs, files in os.walk(resolved_path):
+                        # Filter out "hidden" directories (used for local overrides/drafts)
+                        dirs[:] = [d for d in dirs if not (d.startswith('_') or d.startswith('.'))]
                         for file in files:
-                            if file.endswith(".txt"):
+                            # Filter out "hidden" files so they don't trigger cache invalidation
+                            if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
                                 try:
                                     fpath = os.path.join(root, file)
                                     m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
@@ -255,9 +259,12 @@ class PromptStackLoader:
 
     def _get_random_file(self, dir_path: str, rng: SeededRandom) -> str:
         candidates = []
-        for root, _, files in os.walk(dir_path):
+        for root, dirs, files in os.walk(dir_path):
+            # Exclude "hidden" directories to avoid picking up overrides or drafts
+            dirs[:] = [d for d in dirs if not (d.startswith('_') or d.startswith('.'))]
             for file in files:
-                if file.endswith(".txt"):
+                # Exclude "hidden" files
+                if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
                     candidates.append(os.path.join(root, file))
         if candidates:
             candidates.sort() # Ensure deterministic order across different OSs
