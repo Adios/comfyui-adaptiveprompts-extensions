@@ -35,6 +35,7 @@ By leveraging this node, you can transition your workflow into a highly adaptabl
 ### Key Features
 *   **Sequential File Processing:** Load and evaluate a list of text files (a "stack") in order. File paths can be relative or specifically pull a random file from a directory.
 *   **Dynamic Stack Modifiers:** Use inline commands like `remove:path/to/file.txt` or `replace:old_path|new_path` to surgically alter a master stack template without changing the underlying files.
+*   **Hidden Files & Local Overrides:** Any file or directory starting with `_` or `.` is completely hidden from the randomizer. This allows you to safely store specialized states or drafts (e.g., `_explicit_override.txt`) alongside your main prompts, loading them only when you explicitly ask for them!
 *   **Automatic LoRA Tag Extraction:** Any `<lora:name:weight>` tags found within your stacked files are automatically extracted and compiled into a clean `lora_string` output to be sent directly to a LoRA Tag Loader.
 *   **Context Accumulation & Overrides:** As files are processed, variables are collected into a `context` dictionary. You can pass context between multiple Stack Loaders, using the **Override** toggle to cleanly re-roll specific elements (like a character's expression) while keeping the rest of the generation state identical.
 
@@ -58,35 +59,38 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
 
 **Inline Stack Commands:**
 Each line within a stack acts as an instruction. Alongside standard file paths, you can use the following commands to modify the stack dynamically right from the node:
-- `random:folder_path` -> Selects a random `.txt` file from the specified directory (includes subfolders).
+- `random:folder_path` -> Selects a random `.txt` file from the specified directory (includes subfolders). *(Note: Files and folders starting with `_` or `.` are ignored).*
 - `remove:file_path` -> Excludes a specific file from being loaded (e.g., `remove:styles/cyberpunk.txt`). Because LoRA tags are always accumulated across the stack and ignore the **Override** toggle, excluding the file that contains the LoRA is the primary way to prevent it from being merged into your final `lora_string` output.
 - `replace:old_file|new_file` -> Swaps a file in-place, allowing targeted modifications without editing the original stack file. 
   - e.g., `replace:lighting/sunny.txt|lighting/rainy.txt` or `replace:random:anime|anime/frieren/frieren.txt`.
+
+**Local Overrides & Hidden Files:**
+A powerful workflow technique is to prefix files or directories with `_` or `.` (e.g., `_action_pose.txt` or `_WIP`). Because these are ignored by the randomizer, they won't randomly appear in your generations. However, you can still load them *explicitly* by writing their exact path in your stack (e.g., `anime/neon_genesis_evangelion/_asuka_override.txt`). This makes managing complex "Context Override" modes much cleaner, as your base options and their specific overrides can live safely in the exact same directory without interfering with each other.
 
 ### 🔀 Stack-Level Conditional Branching (`ps_switch`)
 
 The Prompt Stack Loader includes a built-in pre-processor macro for conditional branching across files. This is extremely useful when an action or clothing choice needs to adapt perfectly to a background scene you loaded earlier in the stack.
 
 For example, imagine a global stack that first loads a specific background scene:
-`backgrounds/scenes/vehicle_interior/ferris_wheel_cabin_01.txt`
+`backgrounds/scenes/urban/cafe_interior.txt`
 This file sets the background details, and defines a scene variable:
-`{ferris wheel}^scene`
+`{cafe}^scene`
 
-Later in the same stack (or in a separate downstream Stack Loader), you load an action file, for example, `actions/leisure/looking_out.txt`. Because the scene variable was established upstream, you can use the `ps_switch(var)` macro to contextually adapt the pose:
+Later in the same stack (or in a separate downstream Stack Loader), you load an action file, for example, `actions/leisure/drinking.txt`. Because the scene variable was established upstream, you can use the `ps_switch(var)` macro to contextually adapt the pose:
 
 ```text
 {
   dynamic pose,
   {ps_switch(scene)
-    | ferris wheel: pressing hands against glass, looking down at the city
+    | cafe: sitting at table, holding a coffee cup
     | swimming pool | beach: splashing water, looking at the horizon
-    | default: looking into the distance
+    | default: standing casually
   }
 }^action
 ```
 
 **How it works:**
-*   **Contextual Matching:** The `PromptStackLoader` checks its accumulated context for the variable `scene`. If it finds `ferris wheel`, it swaps the entire `ps_switch` block with `pressing hands against glass, looking down at the city`.
+*   **Contextual Matching:** The `PromptStackLoader` checks its accumulated context for the variable `scene`. If it finds `cafe`, it swaps the entire `ps_switch` block with `sitting at table, holding a coffee cup`.
 *   **Shared Results (Fallthrough):** You can share a single result across multiple cases by separating them with pipes (e.g., `| swimming pool | beach: splashing water`).
 *   **Default Fallback:** If the variable resolves to something else, or isn't defined at all, it outputs the `default:` branch.
 *   **Safe "Pass-Through":** If the variable `scene` is completely missing from the upstream context, the macro safely resolves to the `default:` fallback (or an empty string if no default is provided) to prevent syntax errors.
