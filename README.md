@@ -144,6 +144,28 @@ Because Node 1 passes the `mode` variable downstream, any random character picke
 
 This architecture keeps your prompt files highly modular, ensures `random:` selection remains powerful without breaking, and completely eliminates the need for messy override scripts or folder structures.
 
+### 🔄 Self-Referential Overrides (Infinite Stacking)
+
+A powerful way to keep your master templates clean is to use **self-referential variables** to modify existing states without needing dedicated placeholder variables (like `__^outfit_state__`) in your base template.
+
+Because variables defined later in the stack seamlessly overwrite earlier ones, an override file can recall its own previous value, append a new modifier, and save it back!
+
+**Example: Stacking Outfit Modifiers**
+Imagine you have a base template that simply calls `__^outfit__`.
+1. Your stack first loads `outfits/school_uniform.txt`, which contains:
+   `{white shirt, blue pleated skirt}^outfit`
+2. Your stack then loads an override state file like `outfit_states/_wet.txt`. Instead of setting a brand new variable, it references the existing one:
+   `{__^outfit__, wet seethrough fabric}^outfit`
+3. Finally, your stack loads `outfit_states/_torn.txt`:
+   `{__^outfit__, torn edges}^outfit`
+
+**The Result:** The engine elegantly accumulates the values: `white shirt, blue pleated skirt, wet seethrough fabric, torn edges`—all stored perfectly under the single `^outfit` variable. 
+
+This guarantees your main templates stay completely free of bloat, while giving you the flexibility to infinitely stack states (wet, dirty, torn) just by chaining text files!
+
+> **CRITICAL:** For this pattern to work correctly, your `PromptStackLoader` node **must have `override_context` set to `Override`**. If set to `Merge`, the engine will keep both the old and new outfit strings in memory, which may cause the randomizer to sometimes select the old, unmodified outfit.
+
+> **Rule of Thumb:** Order matters. Always load the base definition file before any self-referential override files in your stack.
 ---
 
 ## 🙏 Acknowledgments
