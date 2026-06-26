@@ -1,7 +1,8 @@
 import os
 import re
 import glob
-from typing import List
+from typing import List, Tuple
+from collections import UserDict
 import sys
 import importlib.util
 
@@ -74,21 +75,17 @@ def _normalize_input_context(ctx):
         normalized[var] = _ensure_bucket_dict(bucket)
     return normalized
 
-def _snapshot_context(context: dict) -> dict:
-    snapshot = {}
-    for k, v in context.items():
-        if isinstance(v, dict):
-            snapshot[k] = list(v.keys())
-    return snapshot
+class _OverrideBucket(UserDict):
+    def __init__(self, initial_data):
+        super().__init__()
+        self.data = dict(initial_data)
+        self.cleared = False
 
-def _apply_context_override(context: dict, snapshot: dict) -> None:
-    for k, old_keys in snapshot.items():
-        if k in context and isinstance(context[k], dict):
-            current_keys = list(context[k].keys())
-            new_keys = [key for key in current_keys if key not in old_keys]
-            if new_keys:
-                for old_k in old_keys:
-                    del context[k][old_k]
+    def __setitem__(self, key, value):
+        if not self.cleared:
+            self.data.clear()
+            self.cleared = True
+        super().__setitem__(key, value)
 # --------------------------------
 
 DEFAULT_PROMPT_ROOT = os.path.abspath(
@@ -493,9 +490,10 @@ class PromptStackLoader:
         # Apply switch macros
         cleaned_content = self._resolve_switch_macros(cleaned_content, current_context)
 
-        snapshot = {}
         if override_context:
-            snapshot = _snapshot_context(current_context)
+            for k, v in current_context.items():
+                if isinstance(v, dict):
+                    current_context[k] = _OverrideBucket(v)
 
         # Replicability and Random Isolation:
         # We generate a unique 'sub_seed' for this specific file using our master RNG.
@@ -511,9 +509,6 @@ class PromptStackLoader:
             resolved_vars=current_context,
             hide_comments=True
         )
-
-        if override_context:
-            _apply_context_override(current_context, snapshot)
 
         return evaluated_text.strip(), found_loras
 
@@ -540,8 +535,13 @@ class PromptStackLoader:
             
         # Ensure context buckets are normalized
         for k, v in list(current_context.items()):
-            if not isinstance(v, dict):
-                current_context[k] = _ensure_bucket_dict(v)
+            if isinstance(v, _OverrideBucket):
+                current_context[k] = v.data
+            elif type(v) is not dict:
+                if isinstance(v, dict):
+                    current_context[k] = dict(v)
+                else:
+                    current_context[k] = _ensure_bucket_dict(v)
 
         lora_string = " ".join(lora_tags)
         final_prompt_string = ", ".join(accumulated_prompts)
