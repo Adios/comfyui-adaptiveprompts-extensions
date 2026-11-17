@@ -19,6 +19,8 @@ If you are not using ComfyUI Manager (or if the node is not yet available in the
 ### Dependencies
 This extension strictly depends on the core **Adaptive Prompts** engine. You **MUST** have the official [comfyui-adaptiveprompts](https://github.com/Alectriciti/comfyui-adaptiveprompts) node installed in your `custom_nodes` folder for this extension to function.
 
+> **Recommended Configuration (Latest `comfyui-adaptiveprompts`):** Newer versions of `comfyui-adaptiveprompts` introduce a **Missing Wildcard Behavior** setting in the ComfyUI Settings menu that defaults to `"Inject Warning"` (which injects `!!!VARIABLE "..." NOT FOUND!!!` into the prompt when an optional variable is unset). If your modular stacks rely on optional variables that are not defined in every run, set **Missing Wildcard Behavior** to **`Silently Fail`** in the ComfyUI Settings menu.
+
 ---
 
 ## 🧩 Nodes Included

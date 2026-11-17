@@ -85,3 +85,37 @@ def test_loader_imports_when_another_pack_owns_the_py_package(tmp_path):
 def test_pack_init_loads_as_bare_module_with_foreign_py(tmp_path):
     result = _run(_build(tmp_path, PACK_INIT_UNDER_TEST.format(init=init_path)))
     assert result.returncode == 0, f"pack __init__ failed with a foreign `py` package present:\n{result.stderr}"
+
+
+CONFIG_SYNC_UNDER_TEST = """\
+import importlib.util
+import os
+import sys
+
+# 1. Load extension first (creates _adaptiveprompts_core.config)
+spec = importlib.util.spec_from_file_location("loader_under_test", {loader!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+# 2. Simulate ComfyUI loading the base pack afterwards under its own package name
+base_config_path = os.path.join({base_dir!r}, "py", "config.py")
+if os.path.isfile(base_config_path):
+    cfg_spec = importlib.util.spec_from_file_location("host_adaptiveprompts.py.config", base_config_path)
+    host_cfg = importlib.util.module_from_spec(cfg_spec)
+    sys.modules[cfg_spec.name] = host_cfg
+    cfg_spec.loader.exec_module(host_cfg)
+
+    # Mutate the host config singleton in memory (as /adaptive_prompts/config does)
+    host_cfg.config_instance.config["missing_wildcard_behavior"] = "Silently Fail"
+    module._sync_base_config()
+
+    synth_cfg = sys.modules["_adaptiveprompts_core.config"]
+    assert synth_cfg.config_instance is host_cfg.config_instance
+    assert synth_cfg.get_config("missing_wildcard_behavior") == "Silently Fail"
+"""
+
+
+def test_config_singleton_syncs_when_extension_loads_before_base_pack(tmp_path):
+    body = CONFIG_SYNC_UNDER_TEST.format(loader=loader_path, base_dir=adaptive_prompts_dir)
+    result = _run(_build(tmp_path, body))
+    assert result.returncode == 0, f"config singleton sync failed:\n{result.stderr}"

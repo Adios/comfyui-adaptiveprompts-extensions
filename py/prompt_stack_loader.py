@@ -25,15 +25,22 @@ def _import_base_generator():
     generator_path = os.path.join(base_py_dir, "generator.py")
 
     # Reuse a copy the host application already executed, when the base pack is loaded.
-    for module in list(sys.modules.values()):
+    # Prefer the host pack's own module over our synthetic fallback if both exist.
+    fallback_module = None
+    for name, module in list(sys.modules.items()):
         origin = getattr(module, "__file__", None)
         if not origin:
             continue
         try:
             if os.path.samefile(origin, generator_path):
-                return module
+                if not name.startswith(_BASE_PACKAGE):
+                    return module
+                fallback_module = module
         except OSError:
             continue
+
+    if fallback_module is not None:
+        return fallback_module
 
     if not os.path.isfile(generator_path):
         raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
@@ -44,6 +51,34 @@ def _import_base_generator():
         sys.modules[_BASE_PACKAGE] = package
 
     return importlib.import_module(f"{_BASE_PACKAGE}.generator")
+
+
+def _sync_base_config():
+    """Keep the base pack's config singleton synchronized when this extension loads before the base pack."""
+    base_config_path = os.path.join(adaptive_prompts_dir, "py", "config.py")
+    synth_config = sys.modules.get(f"{_BASE_PACKAGE}.config")
+    host_config = None
+
+    for name, module in list(sys.modules.items()):
+        if name.startswith(_BASE_PACKAGE):
+            continue
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        try:
+            if os.path.samefile(origin, base_config_path):
+                host_config = module
+                break
+        except OSError:
+            continue
+
+    if synth_config is not None:
+        if host_config is not None and hasattr(host_config, "config_instance"):
+            synth_config.config_instance = host_config.config_instance
+        elif hasattr(synth_config, "config_instance") and hasattr(synth_config.config_instance, "load"):
+            config_json = getattr(synth_config, "CONFIG_PATH", os.path.join(adaptive_prompts_dir, "config.json"))
+            if os.path.isfile(config_json):
+                synth_config.config_instance.load()
 
 
 _generator = _import_base_generator()
@@ -203,6 +238,13 @@ class PromptStackLoader:
         
         resolved_base_dir = cls._resolve_base_dir(base_dir)
         node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        config_path = os.path.join(adaptive_prompts_dir, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                m.update(str(os.path.getmtime(config_path)).encode("utf-8"))
+            except OSError:
+                pass
 
         paths = []
         if stack_file:
@@ -544,6 +586,7 @@ class PromptStackLoader:
         return evaluated_text.strip(), found_loras
 
     def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None):
+        _sync_base_config()
         rng = SeededRandom(seed)
         
         resolved_base_dir = self._resolve_base_dir(base_dir)

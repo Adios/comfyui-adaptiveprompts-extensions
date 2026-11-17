@@ -7,13 +7,23 @@ This project (`comfyui-adaptiveprompts-extensions`) is an extension of a "mother
 - **Mother Project Path**: Expected to be found at `../comfyui-adaptiveprompts` relative to this node.
 - **Goal**: Maintain compatibility layers and extend the functionality of the mother project without breaking its internal assumptions.
 
-## 2. The `py/` Namespace (CRITICAL DO NOT MODIFY)
-**RULE:** NEVER create an `__init__.py` file inside the `py/` directory!
+## 2. Top-Level `py/` Package Collisions & `_adaptiveprompts_core` (CRITICAL)
+**RULE:**
+1. NEVER create an `__init__.py` file inside `py/`.
+2. NEVER import the mother project or our own loader via the bare top-level name `from py.X import ...` in production code (`__init__.py` or `py/prompt_stack_loader.py`).
 
 ### Why?
-Both this extension and the mother project store their backend logic in a folder named `py/`. Because neither folder contains an `__init__.py` file, Python 3 treats them as **Implicit Namespace Packages** (PEP 420). This allows Python to logically "merge" the contents of both `py/` folders into a single shared namespace at runtime.
+Both this extension and the mother project store their backend logic in a folder named `py/` without an `__init__.py`. However, several popular third-party ComfyUI custom nodes (`rgthree-comfy`, `comfyui-easy-use`, `efficiency-nodes-comfyui`) also ship a top-level `py/` directory **with an `__init__.py`** (making `py` a **Regular Package**) and insert their directories into `sys.path`.
 
-If you add an `__init__.py` to this project's `py/` folder, it becomes a **Regular Package**. Regular packages do not merge. If this happens, when our code runs `from py.generator import SeededRandom` (which lives in the mother project), Python will exclusively search our `py/` folder, fail to find `generator.py`, and crash. 
+Because Python's import machinery prefers a regular package over PEP 420 namespace packages regardless of `sys.path` order—and caches the winner in `sys.modules["py"]` with a static `__path__`—importing `from py.generator import ...` or `from py.prompt_stack_loader import ...` resolves into the foreign custom node pack and fails with `ModuleNotFoundError`.
+
+### How Production Imports Work Instead
+- **`__init__.py`**: Uses a relative import (`from .py.prompt_stack_loader import PromptStackLoader`) and falls back to loading `py/prompt_stack_loader.py` directly by file path via `importlib.util.spec_from_file_location` (since ComfyUI loads custom node `__init__.py` files as bare modules).
+- **`py/prompt_stack_loader.py`**:
+  - `_import_base_generator()` first scans `sys.modules` via `os.path.samefile` to reuse the mother project's already-loaded `generator.py` module if ComfyUI loaded `comfyui-adaptiveprompts` before this extension.
+  - If this extension loads *before* the mother project, it registers a private synthetic package `_adaptiveprompts_core` in `sys.modules` with `__path__ = [os.path.join(adaptive_prompts_dir, "py")]` and imports `_adaptiveprompts_core.generator`. This keeps relative imports inside the mother project (`from .config import get_config`, `from .wildcard_utils import bfs_find_file`) working without touching `sys.path` or `sys.modules["py"]`.
+  - `_sync_base_config()` runs at the start of `PromptStackLoader.process()` to bind `_adaptiveprompts_core.config.config_instance` to the mother project's live `config_instance` (or reload `config.json` from disk), preventing a split-brain config singleton when this extension loads before the mother project at startup.
+  - `PromptStackLoader.IS_CHANGED()` includes `../comfyui-adaptiveprompts/config.json`'s `mtime` so changing settings in the ComfyUI Settings UI immediately invalidates the node cache.
 
 ## 3. Pytest and the `py` Module Collision
 If you are writing or debugging tests, be aware of a known collision with `pytest`.
