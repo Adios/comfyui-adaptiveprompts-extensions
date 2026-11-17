@@ -4,34 +4,65 @@ import glob
 from typing import List, Tuple
 from collections import UserDict
 import sys
+import importlib
 import importlib.util
+import types
 
 adaptive_prompts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfyui-adaptiveprompts"))
 
-added_to_sys_path = False
-if adaptive_prompts_dir not in sys.path:
-    sys.path.insert(0, adaptive_prompts_dir)
-    added_to_sys_path = True
+# The base pack's modules live in a directory named `py`, which is not a unique
+# top-level package name: several other custom node packs ship their own `py/`
+# directory too. A regular package (one with an __init__.py) is resolved ahead of any
+# namespace portion regardless of sys.path order, and the winner is cached in
+# sys.modules for the life of the process, so importing the base pack as bare `py`
+# can silently yield another pack's modules. Load it under a private name instead.
+_BASE_PACKAGE = "_adaptiveprompts_core"
+
+
+def _import_base_generator():
+    """Return the base pack's py/generator module without relying on the name `py`."""
+    base_py_dir = os.path.join(adaptive_prompts_dir, "py")
+    generator_path = os.path.join(base_py_dir, "generator.py")
+
+    # Reuse a copy the host application already executed, when the base pack is loaded.
+    for module in list(sys.modules.values()):
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        try:
+            if os.path.samefile(origin, generator_path):
+                return module
+        except OSError:
+            continue
+
+    if not os.path.isfile(generator_path):
+        raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
+
+    if _BASE_PACKAGE not in sys.modules:
+        package = types.ModuleType(_BASE_PACKAGE)
+        package.__path__ = [base_py_dir]
+        sys.modules[_BASE_PACKAGE] = package
+
+    return importlib.import_module(f"{_BASE_PACKAGE}.generator")
+
+
+_generator = _import_base_generator()
+SeededRandom = _generator.SeededRandom
+DEFAULT_WILDCARD_ROOT = _generator.DEFAULT_WILDCARD_ROOT
 
 try:
-    from py.generator import SeededRandom, DEFAULT_WILDCARD_ROOT
-    try:
-        from py.generator import evaluate_prompt_core
-    except ImportError:
-        from py.generator import resolve_wildcards
-        def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
-            """Fallback implementation for older core versions (like the 'main' branch)."""
-            comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
-            for block in comment_blocks:
-                _ = resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
-            if hide_comments:
-                prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
-            return resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
-except ImportError:
-    raise ImportError("The 'comfyui-adaptiveprompts-extensions' node requires the 'comfyui-adaptiveprompts' custom node to be installed.")
-finally:
-    if added_to_sys_path:
-        sys.path.remove(adaptive_prompts_dir)
+    evaluate_prompt_core = _generator.evaluate_prompt_core
+except AttributeError:
+    _resolve_wildcards = _generator.resolve_wildcards
+
+    def evaluate_prompt_core(prompt: str, rng, wildcard_dir: str, resolved_vars: dict, hide_comments: bool = True) -> str:
+        """Fallback implementation for older core versions (like the 'main' branch)."""
+        comment_blocks = re.findall(r"##(.*?)##", prompt, flags=re.DOTALL)
+        for block in comment_blocks:
+            _ = _resolve_wildcards(block, rng, wildcard_dir, _resolved_vars=resolved_vars)
+        if hide_comments:
+            prompt = re.sub(r"##.*?##", "", prompt, flags=re.DOTALL)
+        return _resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 
 # --- Context Helper Functions ---
 def _is_safe_path(base: str, path: str) -> bool:
