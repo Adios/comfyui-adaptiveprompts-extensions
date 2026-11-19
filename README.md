@@ -72,17 +72,18 @@ Each line in a `stack_file` or `inline_stack` acts as an instruction. Commands a
 
 - **`import:<stack_path>`** — Recursively includes another stack file in-place at the exact position of the `import:` line.
   - **Strict `base_dir` Sandbox:** Unlike the node's top-level `stack_file` input, `import:` is strictly constrained to the node's resolved `base_dir`. For example, if `base_dir` is set to `prompt_examples/arch/illustrious`, `import:` can only load files inside `prompt_examples/arch/illustrious` (escaping via `../`, absolute paths, or symlinks pointing outside `base_dir` are blocked, and files >5MB are skipped).
-  - **Cycle Protection & Sequential Reuse:** The loader tracks the active import chain (`A -> B -> A`). Circular imports (direct self-imports, mutual cycles, or symlink loops) are automatically skipped with a console warning. However, importing the same snippet twice sequentially in the same stack is allowed and evaluated in order.
+  - **Cycle & Depth Protection:** The loader tracks the active import chain (`A -> B -> A`) and enforces a maximum nesting depth of 32. Circular imports (direct self-imports, mutual cycles, or symlink loops) are automatically skipped with a console warning, while importing the same snippet twice sequentially in the same stack is allowed and evaluated in order.
+  - **Subtree-Scoped Modifiers:** Any `remove:` or `replace:` written *inside* an imported stack file only modifies that file's own subtree—it will never leak out to affect sibling imports or lines added later in the parent stack.
 - **`random:<folder_path>`** — Selects a deterministic random `.txt` file from the specified directory (including subfolders) using the node's `seed`.
   - Files and directories starting with `_` or `.` are automatically ignored by the randomizer.
 
 ##### 2. Stack Modifier Commands
 
-Because `import:` directives are expanded first, `replace:` and `remove:` can target both local lines and lines originating inside any imported stack file:
+Because `import:` directives are resolved bottom-up, `replace:` and `remove:` can target local lines, lines originating inside any imported stack file, or even an entire `import:` block itself:
 
-- **`replace:<old_path>|<new_path>`** — Swaps a matching line in-place while preserving its exact position in the execution order.
-  - Works on both standard file paths and `random:` lines (e.g., `replace:lighting/sunny.txt|lighting/rainy.txt` or `replace:random:anime|anime/frieren/frieren.txt`).
-- **`remove:<file_path>`** — Excludes a matching line from being loaded (e.g., `remove:styles/cyberpunk.txt`).
+- **`replace:<old_path>|<new_path>`** — Swaps a matching line (or entire `import:` block) in-place while preserving its exact position in the execution order.
+  - Works on standard file paths, `random:` lines, and `import:` directives (e.g., `replace:lighting/sunny.txt|lighting/rainy.txt`, `replace:random:anime|anime/frieren/frieren.txt`, `replace:lighting/sunny.txt|import:stacks/presets/complex_lighting.txt`, or `replace:import:stacks/presets/day.txt|import:stacks/presets/night.txt`).
+- **`remove:<file_path>`** — Excludes a matching line or entire `import:` block from being loaded (e.g., `remove:styles/cyberpunk.txt` or `remove:import:stacks/presets/extra.txt`).
   - Because `<lora:...>` tags are always accumulated across the stack and ignore the **Override** toggle, `remove:` is the primary way to exclude a file containing an unwanted LoRA.
 
 ##### 3. Comments & Hidden Overrides

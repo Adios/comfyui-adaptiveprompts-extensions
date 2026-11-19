@@ -376,3 +376,231 @@ def test_import_end_to_end_process(tmp_path, monkeypatch):
 
     assert prompt == "1girl, rainy lighting, masterpiece"
     assert lora_str == "<lora:char_lora:0.8>"
+
+
+def test_import_nested_with_chained_replace_and_remove(tmp_path, monkeypatch):
+    """
+    Tests `root -> some_other -> some_some_other` where intermediate and root stacks
+    both contain `remove:` and chained `replace:` directives (including modifiers
+    placed above `import:` lines).
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    for name in ["a.txt", "a_v2.txt", "a_v3.txt", "b.txt", "c.txt", "c_v2.txt", "d.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+
+    stacks_dir = prompts_dir / "stacks"
+    stacks_dir.mkdir()
+
+    # Level 2: some_some_other
+    (stacks_dir / "some_some_other.stack.txt").write_text(
+        "a.txt\nb.txt\nc.txt\nd.txt\n",
+        encoding="utf-8",
+    )
+
+    # Level 1: some_other (removes b.txt, replaces a.txt -> a_v2.txt and c.txt -> c_v2.txt)
+    (stacks_dir / "some_other.stack.txt").write_text(
+        "import:stacks/some_some_other.stack.txt\n"
+        "remove:b.txt\n"
+        "replace:a.txt|a_v2.txt\n"
+        "replace:c.txt|c_v2.txt\n",
+        encoding="utf-8",
+    )
+
+    # Level 0: root (places modifiers even BEFORE import:, chaining a_v2.txt -> a_v3.txt and removing c_v2.txt)
+    (stacks_dir / "root.stack.txt").write_text(
+        "replace:a_v2.txt|a_v3.txt\n"
+        "remove:c_v2.txt\n"
+        "import:stacks/some_other.stack.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+    raw_lines = loader._resolve_paths(str(prompts_dir), "stacks/root.stack.txt", "")
+    files = loader._build_final_file_list(raw_lines, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == ["a_v3.txt", "d.txt"]
+
+
+def test_import_replace_self_and_roundtrip_swap(tmp_path, monkeypatch):
+    """
+    Verifies that replacing a file with itself (`replace:a.txt|a.txt`) or
+    swapping `a.txt -> b.txt` in an imported stack and `b.txt -> a.txt` in the
+    parent stack never causes an infinite loop.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    (prompts_dir / "a.txt").write_text("a", encoding="utf-8")
+    (prompts_dir / "b.txt").write_text("b", encoding="utf-8")
+
+    stacks_dir = prompts_dir / "stacks"
+    stacks_dir.mkdir()
+
+    (stacks_dir / "child.stack.txt").write_text(
+        "a.txt\nreplace:a.txt|a.txt\nreplace:a.txt|b.txt\n",
+        encoding="utf-8",
+    )
+
+    inline_stack = "\n".join([
+        "import:stacks/child.stack.txt",
+        "replace:b.txt|a.txt",
+        "replace:a.txt|a.txt",
+    ])
+
+    loader = PromptStackLoader()
+    raw_lines = loader._resolve_paths(str(prompts_dir), "", inline_stack)
+    files = loader._build_final_file_list(raw_lines, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == ["a.txt"]
+
+
+def test_import_max_depth_limit(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that non-cyclic deep import chains exceeding MAX_IMPORT_DEPTH (32)
+    stop gracefully with a warning instead of raising RecursionError.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    (prompts_dir / "leaf.txt").write_text("leaf", encoding="utf-8")
+
+    total_chain = PromptStackLoader.MAX_IMPORT_DEPTH + 5
+    for i in range(total_chain):
+        next_import = f"import:depth_{i + 1}.stack.txt\n" if i + 1 < total_chain else ""
+        (prompts_dir / f"depth_{i}.stack.txt").write_text(
+            f"leaf.txt\n{next_import}",
+            encoding="utf-8",
+        )
+
+    loader = PromptStackLoader()
+    raw_lines = loader._resolve_paths(str(prompts_dir), "depth_0.stack.txt", "")
+    files = loader._build_final_file_list(raw_lines, str(prompts_dir), SeededRandom(0))
+
+    assert len(files) == PromptStackLoader.MAX_IMPORT_DEPTH
+    assert f"Maximum import depth ({PromptStackLoader.MAX_IMPORT_DEPTH}) exceeded" in capsys.readouterr().out
+
+
+def test_import_sibling_scope_isolation_and_parent_readdition(tmp_path, monkeypatch):
+    """
+    Verifies that `remove:` and `replace:` inside an imported file (`branch1`)
+    are strictly scoped to `branch1`'s own subtree and do NOT leak out to
+    mutate sibling imports (`branch2`) or lines added later in the parent stack.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    for name in ["a.txt", "b.txt", "b1.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+
+    stacks_dir = prompts_dir / "stacks"
+    stacks_dir.mkdir()
+
+    (stacks_dir / "common.stack.txt").write_text("a.txt\nb.txt\n", encoding="utf-8")
+
+    # branch1 removes a.txt and replaces b.txt -> b1.txt within its own subtree
+    (stacks_dir / "branch1.stack.txt").write_text(
+        "import:stacks/common.stack.txt\n"
+        "remove:a.txt\n"
+        "replace:b.txt|b1.txt\n",
+        encoding="utf-8",
+    )
+
+    # branch2 imports common.stack.txt unmodified
+    (stacks_dir / "branch2.stack.txt").write_text(
+        "import:stacks/common.stack.txt\n",
+        encoding="utf-8",
+    )
+
+    # root imports branch1, branch2, and also adds a.txt at the end
+    (stacks_dir / "root.stack.txt").write_text(
+        "import:stacks/branch1.stack.txt\n"
+        "import:stacks/branch2.stack.txt\n"
+        "a.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+    raw_lines = loader._resolve_paths(str(prompts_dir), "stacks/root.stack.txt", "")
+    files = loader._build_final_file_list(raw_lines, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == [
+        "b1.txt",  # from branch1
+        "a.txt",   # from branch2 (untouched by branch1's remove:a.txt)
+        "b.txt",   # from branch2 (untouched by branch1's replace:b.txt|b1.txt)
+        "a.txt",   # from root (untouched by branch1's remove:a.txt)
+    ]
+
+
+def test_import_modifier_combinations_targeting_and_replacing_with_import(tmp_path, monkeypatch, capsys):
+    """
+    Covers all combinations of `remove:` and `replace:` interacting with `import:` targets:
+    1. `remove:import:<stack>` (both same-scope and parent removing an inner child's import block)
+    2. `replace:import:<s1>|import:<s2>` (swapping one imported stack for another in-place)
+    3. `replace:import:<s1>|<file>` (swapping an entire imported stack block for a single file)
+    4. `replace:<file>|import:<s2>` (expanding a single file into a multi-file imported stack)
+    5. Cycle protection when `replace:<file>|import:<self>` attempts a circular import via replace.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    for name in ["start.txt", "g1.txt", "g2.txt", "alt1.txt", "alt2.txt", "single.txt", "end.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+
+    stacks_dir = prompts_dir / "stacks"
+    stacks_dir.mkdir()
+
+    (stacks_dir / "grand1.stack.txt").write_text("g1.txt\ng2.txt\n", encoding="utf-8")
+    (stacks_dir / "grand2.stack.txt").write_text("alt1.txt\nalt2.txt\n", encoding="utf-8")
+    (stacks_dir / "child.stack.txt").write_text(
+        "start.txt\nimport:stacks/grand1.stack.txt\nend.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+
+    # 1. Parent removes an inner child's `import:stacks/grand1.stack.txt` block completely
+    raw1 = loader._resolve_paths(
+        str(prompts_dir),
+        "stacks/child.stack.txt",
+        "remove:import:stacks/grand1.stack.txt",
+    )
+    files1 = loader._build_final_file_list(raw1, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files1] == ["start.txt", "end.txt"]
+
+    # 2. Outer stack swaps an inner child's `import:stacks/grand1.stack.txt` with `import:stacks/grand2.stack.txt`
+    (stacks_dir / "parent_swap_import.stack.txt").write_text(
+        "import:stacks/child.stack.txt\n"
+        "replace:import:stacks/grand1.stack.txt|import:stacks/grand2.stack.txt\n",
+        encoding="utf-8",
+    )
+    raw2 = loader._resolve_paths(str(prompts_dir), "stacks/parent_swap_import.stack.txt", "")
+    files2 = loader._build_final_file_list(raw2, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files2] == ["start.txt", "alt1.txt", "alt2.txt", "end.txt"]
+
+    # 3. Outer stack swaps an inner child's `import:stacks/grand1.stack.txt` with a single file `single.txt`
+    (stacks_dir / "parent_collapse_import.stack.txt").write_text(
+        "import:stacks/child.stack.txt\n"
+        "replace:import:stacks/grand1.stack.txt|single.txt\n",
+        encoding="utf-8",
+    )
+    raw3 = loader._resolve_paths(str(prompts_dir), "stacks/parent_collapse_import.stack.txt", "")
+    files3 = loader._build_final_file_list(raw3, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files3] == ["start.txt", "single.txt", "end.txt"]
+
+    # 4. Outer stack swaps a single file `g1.txt` inside an imported stack with `import:stacks/grand2.stack.txt`
+    (stacks_dir / "parent_expand_file.stack.txt").write_text(
+        "import:stacks/child.stack.txt\n"
+        "replace:g1.txt|import:stacks/grand2.stack.txt\n",
+        encoding="utf-8",
+    )
+    raw4 = loader._resolve_paths(str(prompts_dir), "stacks/parent_expand_file.stack.txt", "")
+    files4 = loader._build_final_file_list(raw4, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files4] == ["start.txt", "alt1.txt", "alt2.txt", "g2.txt", "end.txt"]
+
+    # 5. Cyclic import attempted via `replace:start.txt|import:stacks/cycle_replace.stack.txt`
+    (stacks_dir / "cycle_replace.stack.txt").write_text(
+        "start.txt\n"
+        "replace:start.txt|import:stacks/cycle_replace.stack.txt\n"
+        "end.txt\n",
+        encoding="utf-8",
+    )
+    raw5 = loader._resolve_paths(str(prompts_dir), "stacks/cycle_replace.stack.txt", "")
+    files5 = loader._build_final_file_list(raw5, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files5] == ["end.txt"]
+    assert "Circular import detected" in capsys.readouterr().out

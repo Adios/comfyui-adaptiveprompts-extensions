@@ -230,6 +230,155 @@ class PromptStackLoader:
             resolved_base_dir = os.path.join(node_root, "prompts")
         return resolved_base_dir
 
+    MAX_IMPORT_DEPTH = 32
+    _IMPORT_BEGIN_PREFIX = "__ps_begin_import__:"
+    _IMPORT_END_PREFIX = "__ps_end_import__:"
+
+    @classmethod
+    def _normalize_match(cls, p: str) -> str:
+        """
+        Normalizes slashes and redundant relative segments (e.g., `./`) for
+        cross-platform matching across file paths, `random:`, and `import:`.
+        """
+        p = p.strip()
+        for prefix in ("random:", "import:"):
+            if p.startswith(prefix):
+                core = p[len(prefix):].strip().replace("\\", "/")
+                if not core:
+                    return prefix
+                core = os.path.normpath(core).replace("\\", "/")
+                return f"{prefix}{core}"
+        return os.path.normpath(p.replace("\\", "/")).replace("\\", "/")
+
+    @classmethod
+    def _parse_modifier(cls, clean_line: str):
+        """
+        Parses a `remove:<target>` or `replace:<old>|<new>` line into a tuple
+        `(mod_type, normalized_target_key, new_path_or_none)`, or returns None
+        if the line is not a valid modifier command.
+        """
+        if clean_line.startswith("remove:"):
+            path_to_exclude = clean_line[len("remove:"):].strip()
+            if path_to_exclude:
+                return ("remove", cls._normalize_match(path_to_exclude), None)
+            return None
+        if clean_line.startswith("replace:"):
+            parts = clean_line[len("replace:"):].split("|", 1)
+            if len(parts) == 2:
+                old_path = parts[0].strip()
+                new_path = parts[1].strip()
+                if old_path and new_path:
+                    return ("replace", cls._normalize_match(old_path), new_path)
+            return None
+        return None
+
+    @classmethod
+    def _is_import_marker(cls, line: str) -> bool:
+        return line.startswith(cls._IMPORT_BEGIN_PREFIX) or line.startswith(cls._IMPORT_END_PREFIX)
+
+    @classmethod
+    def _apply_modifiers_to_lines(
+        cls,
+        lines: List[str],
+        modifiers: List[Tuple[str, str, str]],
+        resolved_base_dir: str,
+        active_stack: List[str] = None,
+        visited_stack_files: List[str] = None,
+        expand_replacement_imports: bool = True,
+        log_unused: bool = True,
+    ) -> List[str]:
+        """
+        Applies `remove:` and `replace:` modifiers sequentially to `lines`.
+
+        Supported combinations:
+        1. File / `random:` targets (`remove:a.txt`, `replace:a.txt|b.txt`, `replace:random:dir|a.txt`):
+           Matches individual lines in-place.
+        2. Replacing a line with an `import:` (`replace:a.txt|import:sub.stack.txt`):
+           Expands the replacement `import:` in-place with full sandbox, cycle, and depth checks.
+        3. Targeting an `import:` directive (`remove:import:sub.stack.txt`,
+           `replace:import:sub.stack.txt|import:alt.stack.txt`, `replace:import:sub.stack.txt|a.txt`):
+           Matches either an unexpanded `import:` line (pre-expansion) or the entire block of
+           lines produced by an inner `import:` (delimited by internal begin/end markers).
+        4. Self-replacement (`replace:a.txt|a.txt`) and round-trip swaps (`a -> b` then `b -> a`):
+           Each modifier executes in a single linear pass over `current_lines`, so self-swaps
+           and round-trip swaps terminate in O(N) without infinite loops.
+        """
+        if active_stack is None:
+            active_stack = []
+
+        current_lines = list(lines)
+        for mod_type, target_key, new_path in modifiers:
+            matched = False
+            next_lines = []
+
+            # Prepare replacement payload once if this is a `replace:` modifier.
+            replacement_payload = []
+            if mod_type == "replace":
+                if expand_replacement_imports and new_path.strip().startswith("import:"):
+                    replacement_payload = cls._expand_import_lines(
+                        [new_path],
+                        resolved_base_dir,
+                        active_stack=active_stack,
+                        visited_stack_files=visited_stack_files,
+                        apply_scope_modifiers=True,
+                        log_unused=log_unused,
+                    )
+                else:
+                    replacement_payload = [new_path]
+
+            if target_key.startswith("import:"):
+                begin_tag = f"{cls._IMPORT_BEGIN_PREFIX}{target_key}"
+                end_tag = f"{cls._IMPORT_END_PREFIX}{target_key}"
+                block_depth = 0
+
+                for item in current_lines:
+                    stripped = item.strip()
+                    # Case A: Matches an already-expanded inner import block via boundary markers
+                    if stripped == begin_tag:
+                        if block_depth == 0:
+                            matched = True
+                            if mod_type == "replace":
+                                next_lines.extend(replacement_payload)
+                        block_depth += 1
+                        continue
+                    if stripped == end_tag:
+                        if block_depth > 0:
+                            block_depth -= 1
+                            continue
+                    if block_depth > 0:
+                        continue
+
+                    # Case B: Matches an unexpanded `import:` line directly
+                    if not cls._is_import_marker(stripped) and cls._normalize_match(stripped) == target_key:
+                        matched = True
+                        if mod_type == "replace":
+                            next_lines.extend(replacement_payload)
+                        continue
+
+                    next_lines.append(item)
+            else:
+                for item in current_lines:
+                    stripped = item.strip()
+                    if cls._is_import_marker(stripped):
+                        next_lines.append(item)
+                        continue
+                    if cls._normalize_match(stripped) == target_key:
+                        matched = True
+                        if mod_type == "replace":
+                            next_lines.extend(replacement_payload)
+                    else:
+                        next_lines.append(item)
+
+            if not matched and log_unused:
+                if mod_type == "remove":
+                    print(f"[Adaptive Prompts] Debug: Exclusion target '{target_key}' did not match any loaded paths.")
+                elif mod_type == "replace":
+                    print(f"[Adaptive Prompts] Debug: Swap target '{target_key}' -> '{new_path}' did not match any loaded paths.")
+
+            current_lines = next_lines
+
+        return current_lines
+
     @classmethod
     def _expand_import_lines(
         cls,
@@ -237,21 +386,85 @@ class PromptStackLoader:
         resolved_base_dir: str,
         active_stack: List[str] = None,
         visited_stack_files: List[str] = None,
+        apply_scope_modifiers: bool = False,
+        log_unused: bool = True,
     ) -> List[str]:
         """
-        Recursively expands `import:<relative_path>` directives in-place.
+        Recursively expands `import:<relative_path>` directives in-place with subtree-scoped
+        modifier evaluation.
 
-        Security: Every imported file is strictly resolved against and constrained to
-        `resolved_base_dir` via `_is_safe_path`.
-        Cycle Prevention: Tracks canonical file paths (`os.path.realpath`) in the active
-        call chain (`active_stack`). Cyclic imports (`A -> A`, `A -> B -> A`) are logged
-        and skipped, while sequential non-cyclic imports of the same snippet are allowed.
+        How nested scopes work:
+        1. Pre-Import Pass: Any modifier in the current scope that targets a direct `import:`
+           line in the same scope (e.g., `remove:import:foo.txt` or `replace:import:foo.txt|...`)
+           is applied before opening files from disk.
+        2. Recursive Import Pass: Each remaining `import:` line is validated against:
+           - `MAX_IMPORT_DEPTH` (32) to prevent deep recursion errors.
+           - `_is_safe_path(resolved_base_dir, ...)` to enforce the `base_dir` sandbox.
+           - `active_stack` (`os.path.realpath`) to prevent circular imports (`A -> A`, `A -> B -> A`)
+             while allowing sequential non-cyclic reuse of the same snippet.
+           - The 5MB file size limit.
+           Each imported file is resolved with `apply_scope_modifiers=True`, meaning its own
+           internal `remove:` and `replace:` commands only affect its own subtree and cannot
+           leak into sibling imports or later lines in the parent stack.
+        3. Post-Import Pass: When `apply_scope_modifiers=True`, the current scope's remaining
+           `remove:` and `replace:` modifiers are applied to the expanded lines of this scope.
+           When `apply_scope_modifiers=False` (used by `_resolve_paths` for the root scope),
+           the root scope's post-import modifiers are preserved at the end of the returned list
+           to be applied by `_build_final_file_list`.
         """
         if active_stack is None:
             active_stack = []
 
-        expanded = []
+        content_and_imports = []
+        raw_modifier_lines = []
+        parsed_modifiers = []
+
         for line in raw_lines:
+            clean_line = line.strip()
+            if not clean_line or clean_line.startswith("#"):
+                continue
+            mod = cls._parse_modifier(clean_line)
+            if mod is not None:
+                raw_modifier_lines.append(clean_line)
+                parsed_modifiers.append(mod)
+            else:
+                content_and_imports.append(line)
+
+        # Step 1: Pre-Import interception for modifiers targeting a direct `import:` line
+        # in the current scope (avoids reading a removed/replaced stack file from disk).
+        remaining_raw_modifiers = []
+        remaining_parsed_modifiers = []
+        direct_import_keys = {
+            cls._normalize_match(l.strip())
+            for l in content_and_imports
+            if l.strip().startswith("import:")
+        }
+
+        for raw_mod, parsed_mod in zip(raw_modifier_lines, parsed_modifiers):
+            mod_type, target_key, new_path = parsed_mod
+            if target_key.startswith("import:") and target_key in direct_import_keys:
+                content_and_imports = cls._apply_modifiers_to_lines(
+                    content_and_imports,
+                    [parsed_mod],
+                    resolved_base_dir,
+                    active_stack=active_stack,
+                    visited_stack_files=visited_stack_files,
+                    expand_replacement_imports=False,
+                    log_unused=log_unused,
+                )
+                # Refresh direct_import_keys in case a replace swapped `import:A` -> `import:B`
+                direct_import_keys = {
+                    cls._normalize_match(l.strip())
+                    for l in content_and_imports
+                    if l.strip().startswith("import:")
+                }
+            else:
+                remaining_raw_modifiers.append(raw_mod)
+                remaining_parsed_modifiers.append(parsed_mod)
+
+        # Step 2: Expand all remaining `import:` lines in-place.
+        expanded = []
+        for line in content_and_imports:
             clean_line = line.strip()
             if not clean_line.startswith("import:"):
                 expanded.append(line)
@@ -260,6 +473,10 @@ class PromptStackLoader:
             import_target = clean_line[len("import:"):].strip().replace("\\", "/")
             if not import_target:
                 print("[Adaptive Prompts] Warning: Empty 'import:' directive. Skipping.")
+                continue
+
+            if len(active_stack) >= cls.MAX_IMPORT_DEPTH:
+                print(f"[Adaptive Prompts] Warning: Maximum import depth ({cls.MAX_IMPORT_DEPTH}) exceeded at '{import_target}'. Skipping.")
                 continue
 
             resolved_import = os.path.normpath(os.path.join(resolved_base_dir, import_target))
@@ -289,16 +506,32 @@ class PromptStackLoader:
             if visited_stack_files is not None:
                 visited_stack_files.append(resolved_import)
 
-            expanded.extend(
-                cls._expand_import_lines(
-                    imported_lines,
-                    resolved_base_dir,
-                    active_stack=active_stack + [real_import],
-                    visited_stack_files=visited_stack_files,
-                )
+            norm_import_key = cls._normalize_match(clean_line)
+            child_expanded = cls._expand_import_lines(
+                imported_lines,
+                resolved_base_dir,
+                active_stack=active_stack + [real_import],
+                visited_stack_files=visited_stack_files,
+                apply_scope_modifiers=True,
+                log_unused=log_unused,
+            )
+            expanded.append(f"{cls._IMPORT_BEGIN_PREFIX}{norm_import_key}")
+            expanded.extend(child_expanded)
+            expanded.append(f"{cls._IMPORT_END_PREFIX}{norm_import_key}")
+
+        # Step 3: Apply this scope's post-import modifiers to the expanded lines of this scope.
+        if apply_scope_modifiers:
+            return cls._apply_modifiers_to_lines(
+                expanded,
+                remaining_parsed_modifiers,
+                resolved_base_dir,
+                active_stack=active_stack,
+                visited_stack_files=visited_stack_files,
+                expand_replacement_imports=True,
+                log_unused=log_unused,
             )
 
-        return expanded
+        return expanded + remaining_raw_modifiers
 
     @classmethod
     def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
@@ -316,7 +549,8 @@ class PromptStackLoader:
             except OSError:
                 pass
 
-        paths = []
+        raw_root_lines = []
+        root_active_stack = []
         visited_stack_files = []
         if stack_file:
             stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_file))
@@ -327,26 +561,21 @@ class PromptStackLoader:
                         print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping read in IS_CHANGED.")
                     else:
                         with open(stack_path, "r", encoding="utf-8") as f:
-                            file_lines = f.readlines()
-                        paths.extend(
-                            cls._expand_import_lines(
-                                file_lines,
-                                resolved_base_dir,
-                                active_stack=[os.path.realpath(stack_path)],
-                                visited_stack_files=visited_stack_files,
-                            )
-                        )
+                            raw_root_lines.extend(f.readlines())
+                        root_active_stack.append(os.path.realpath(stack_path))
                 except OSError:
                     pass
         if inline_stack:
-            paths.extend(
-                cls._expand_import_lines(
-                    inline_stack.splitlines(),
-                    resolved_base_dir,
-                    active_stack=[],
-                    visited_stack_files=visited_stack_files,
-                )
-            )
+            raw_root_lines.extend(inline_stack.splitlines())
+
+        paths = cls._expand_import_lines(
+            raw_root_lines,
+            resolved_base_dir,
+            active_stack=root_active_stack,
+            visited_stack_files=visited_stack_files,
+            apply_scope_modifiers=True,
+            log_unused=False,
+        )
 
         for imp_path in visited_stack_files:
             try:
@@ -356,7 +585,7 @@ class PromptStackLoader:
 
         for line in paths:
             line = line.strip()
-            if not line or line.startswith("#") or line.startswith("remove:"):
+            if not line or line.startswith("#") or cls._is_import_marker(line) or line.startswith("remove:"):
                 continue
             if line.startswith("replace:"):
                 parts = line[8:].split("|", 1)
@@ -405,7 +634,8 @@ class PromptStackLoader:
         directives) remain strictly sandboxed against the `base_dir` during the final
         file resolution phase.
         """
-        paths = []
+        raw_root_lines = []
+        root_active_stack = []
         if stack_file:
             # Use the variable 'stack_path' for stack configuration files
             stack_path = os.path.normpath(os.path.join(base_dir, stack_file))
@@ -418,27 +648,24 @@ class PromptStackLoader:
                         print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping.")
                     else:
                         with open(stack_path, "r", encoding="utf-8") as f:
-                            file_lines = f.readlines()
-                        paths.extend(
-                            self._expand_import_lines(
-                                file_lines,
-                                base_dir,
-                                active_stack=[os.path.realpath(stack_path)],
-                            )
-                        )
+                            raw_root_lines.extend(f.readlines())
+                        root_active_stack.append(os.path.realpath(stack_path))
                 except OSError as e:
                     print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
 
         if inline_stack:
-            paths.extend(
-                self._expand_import_lines(
-                    inline_stack.splitlines(),
-                    base_dir,
-                    active_stack=[],
-                )
-            )
+            raw_root_lines.extend(inline_stack.splitlines())
 
-        return paths
+        if not raw_root_lines:
+            return []
+
+        return self._expand_import_lines(
+            raw_root_lines,
+            base_dir,
+            active_stack=root_active_stack,
+            apply_scope_modifiers=True,
+            log_unused=True,
+        )
 
     def _get_random_file(self, dir_path: str, rng: SeededRandom) -> str:
         candidates = []
@@ -455,71 +682,37 @@ class PromptStackLoader:
         return ""
 
     def _build_final_file_list(self, raw_lines: List[str], resolved_base_dir: str, rng: SeededRandom) -> List[str]:
-        def _normalize_match(p: str) -> str:
-            # Normalizes slashes and redundant ./ for cross-platform string matching.
-            is_rand = p.startswith("random:")
-            core = p[7:].strip() if is_rand else p
-            core = os.path.normpath(core).replace("\\", "/")
-            return f"random:{core}" if is_rand else core
-
-        # Pass 1 (Identify Modifiers)
-        exclusions = set()
-        swaps = {}
+        # Separate content lines and any remaining unapplied modifiers (e.g., if
+        # `_build_final_file_list` is invoked directly with raw lines in tests).
+        content_lines = []
+        modifiers = []
         for line in raw_lines:
             clean_line = line.strip()
-            if clean_line.startswith("remove:"):
-                path_to_exclude = clean_line[7:].strip()
-                if path_to_exclude:
-                    exclusions.add(_normalize_match(path_to_exclude))
-            elif clean_line.startswith("replace:"):
-                # Slice off 'replace:' and split by the first pipe
-                parts = clean_line[8:].split("|", 1)
-                if len(parts) == 2:
-                    old_path = parts[0].strip()
-                    new_path = parts[1].strip()
-                    if old_path and new_path:
-                        swaps[_normalize_match(old_path)] = new_path
-
-        # Pass 2 (Filter and Swap the Stack)
-        valid_lines = []
-        unused_exclusions = exclusions.copy()
-        unused_swaps = set(swaps.keys())
-
-        for line in raw_lines:
-            clean_line = line.strip()
-            # Skip empty lines, comments, and the modifier commands themselves
-            if not clean_line or clean_line.startswith("#") or clean_line.startswith("remove:") or clean_line.startswith("replace:"):
+            if not clean_line or clean_line.startswith("#"):
                 continue
+            mod = self._parse_modifier(clean_line)
+            if mod is not None:
+                modifiers.append(mod)
+            else:
+                content_lines.append(clean_line)
 
-            match_key = _normalize_match(clean_line)
-
-            # Handle Exclusions
-            if match_key in exclusions:
-                if match_key in unused_exclusions:
-                    unused_exclusions.remove(match_key)
-                continue
-
-            # Handle Swaps
-            if match_key in swaps:
-                valid_lines.append(swaps[match_key])
-                if match_key in unused_swaps:
-                    unused_swaps.remove(match_key)
-                continue
-
-            # If not modified, keep the original line
-            valid_lines.append(line)
-
-        # Pass 3 (Typo Check / Debug Warning)
-        for unused in unused_exclusions:
-            print(f"[Adaptive Prompts] Debug: Exclusion target '{unused}' did not match any loaded paths.")
-        for unused in unused_swaps:
-            print(f"[Adaptive Prompts] Debug: Swap target '{unused}' -> '{swaps[unused]}' did not match any loaded paths.")
+        if modifiers:
+            valid_lines = self._apply_modifiers_to_lines(
+                content_lines,
+                modifiers,
+                resolved_base_dir,
+                active_stack=[],
+                expand_replacement_imports=True,
+                log_unused=True,
+            )
+        else:
+            valid_lines = content_lines
 
         files_to_process = []
         for line in valid_lines:
             line = line.strip()
-            # We already filtered empty and # lines, but we re-strip for safety
-            if not line or line.startswith("#"):
+            # Filter empty lines, comments, and internal import boundary markers
+            if not line or line.startswith("#") or self._is_import_marker(line):
                 continue
 
             is_random = line.startswith("random:")
