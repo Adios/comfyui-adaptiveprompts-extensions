@@ -421,7 +421,7 @@ class PromptStackLoader:
 
         for line in raw_lines:
             clean_line = line.strip()
-            if not clean_line or clean_line.startswith("#"):
+            if not clean_line or clean_line.startswith("#") or cls._is_import_marker(clean_line):
                 continue
             mod = cls._parse_modifier(clean_line)
             if mod is not None:

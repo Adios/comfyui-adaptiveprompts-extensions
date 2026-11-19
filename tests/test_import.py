@@ -242,6 +242,20 @@ def test_import_security_strictly_constrained_to_base_dir(tmp_path, monkeypatch,
         assert raw_abs == []
         assert "Security Warning: import '/etc/passwd' attempts path traversal" in capsys.readouterr().out
 
+    # 4. Traversal attempts disguised inside `replace:` combinations
+    evasion_stack = "\n".join([
+        "import:valid.stack.txt",
+        "replace:valid_leaf.txt|import:../project_b/outside.stack.txt",
+        "replace:import:valid.stack.txt|import:../project_b/outside.stack.txt",
+        "replace:import:valid.stack.txt|../project_b/outside_leaf.txt",
+        "replace:valid_leaf.txt|random:../project_b",
+    ])
+    raw_evasion = loader._resolve_paths(resolved_base, "", evasion_stack)
+    files_evasion = loader._build_final_file_list(raw_evasion, resolved_base, SeededRandom(0))
+    assert files_evasion == []
+    evasion_out = capsys.readouterr().out
+    assert "Security Warning:" in evasion_out
+
 
 def test_import_edge_cases_comments_missing_and_size_limit(tmp_path, monkeypatch, capsys):
     prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
