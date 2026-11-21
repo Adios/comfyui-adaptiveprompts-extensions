@@ -100,20 +100,53 @@ except AttributeError:
         return _resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 
 # --- Context Helper Functions ---
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
 def _is_safe_path(base: str, path: str) -> bool:
     """
-    Validates that `path` is securely contained within `base`.
+    Validates that `path` is securely contained within `base` across all platforms.
 
-    This function prevents path traversal (e.g., using `../../`) and arbitrary file
-    read vulnerabilities. It fully resolves all symlinks via `os.path.realpath`
-    to ensure that symlink-based evasion attacks cannot escape the sandbox boundary.
-    It returns True if the path is safe, and False if it attempts to escape.
+    Defends against:
+    1. Path traversal (`../../`) and symlink escapes via `os.path.realpath`.
+    2. Case-insensitive filesystem mismatches (Windows/macOS) via `os.path.normcase`.
+    3. Null-byte injection (`\\x00`).
+    4. Windows drive-relative paths (`C:foo.txt`) and NTFS Alternate Data Streams
+       (`file.txt:$DATA` or `file.txt:stream`) via colon rejection in relative subpaths.
+    5. Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+       `LPT1`-`LPT9`, with or without extensions like `CON.txt`) which can hang
+       processes indefinitely on Windows when opened.
     """
+    if not base or not path or "\x00" in base or "\x00" in path:
+        return False
     try:
         real_base = os.path.realpath(base)
         real_path = os.path.realpath(path)
-        return os.path.commonpath([real_base, real_path]) == real_base
-    except ValueError:
+        norm_base = os.path.normcase(real_base)
+        norm_path = os.path.normcase(real_path)
+        if os.path.commonpath([norm_base, norm_path]) != norm_base:
+            return False
+
+        # Inspect both the resolved relative subpath and raw target tail for
+        # cross-platform device names, NTFS Alternate Data Streams, or drive colons.
+        rel_subpath = os.path.relpath(real_path, real_base).replace("\\", "/")
+        raw_tail = os.path.relpath(os.path.abspath(path), os.path.abspath(base)).replace("\\", "/")
+        for candidate_rel in (rel_subpath, raw_tail):
+            if ":" in candidate_rel:
+                return False
+            for segment in candidate_rel.split("/"):
+                if not segment or segment == ".":
+                    continue
+                stem = segment.split(".", 1)[0].strip().upper()
+                if stem in _WINDOWS_RESERVED_NAMES:
+                    return False
+
+        return True
+    except (ValueError, OSError):
         return False
 
 def _ensure_bucket_dict(bucket_like):
@@ -218,7 +251,7 @@ class PromptStackLoader:
         to ensure it does not escape the overall extension folder (`node_root`).
         If it fails the security check, it safely defaults to the 'prompts' folder.
         """
-        resolved_base_dir = base_dir.strip()
+        resolved_base_dir = base_dir.strip().replace("\\", "/")
         node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         if not resolved_base_dir:
             resolved_base_dir = os.path.join(node_root, "prompts")
@@ -233,6 +266,86 @@ class PromptStackLoader:
     MAX_IMPORT_DEPTH = 32
     _IMPORT_BEGIN_PREFIX = "__ps_begin_import__:"
     _IMPORT_END_PREFIX = "__ps_end_import__:"
+
+    @classmethod
+    def _is_current_dir_relative(cls, path_str: str) -> bool:
+        """
+        Returns True if `path_str` is explicitly relative to the current stack file's
+        directory (starts with `./` or `../`, or is `.` / `..`).
+        Paths without a leading `./` or `../` resolve relative to `resolved_base_dir`.
+        """
+        norm_slashes = path_str.strip().replace("\\", "/")
+        return (
+            norm_slashes == "."
+            or norm_slashes == ".."
+            or norm_slashes.startswith("./")
+            or norm_slashes.startswith("../")
+        )
+
+    @classmethod
+    def _canonicalize_scoped_ref(cls, ref_str: str, current_dir: str, resolved_base_dir: str) -> str:
+        """
+        Resolves a file reference, `random:<dir>`, or `import:<stack>` that starts with
+        `./` or `../` against `current_dir` (the directory of the stack file where the
+        line is written) and converts it into a `resolved_base_dir`-relative path with
+        normalized forward slashes for cross-platform compatibility.
+
+        Security: This function only translates relative coordinates; it does NOT grant
+        access. Any path that resolves outside `resolved_base_dir` retains a leading
+        `../` relative to `resolved_base_dir` and is strictly blocked by `_is_safe_path`.
+        """
+        s = ref_str.strip()
+        prefix = ""
+        core = s
+        for pfx in ("random:", "import:"):
+            if s.startswith(pfx):
+                prefix = pfx
+                core = s[len(pfx):].strip()
+                break
+
+        if not core:
+            return prefix
+
+        if "\x00" in core or ":" in core:
+            return f"{prefix}{core}"
+
+        core_norm = core.replace("\\", "/")
+        if current_dir and cls._is_current_dir_relative(core_norm):
+            abs_target = os.path.normpath(os.path.join(current_dir, core_norm))
+            try:
+                rel_to_base = os.path.relpath(abs_target, resolved_base_dir).replace("\\", "/")
+            except ValueError:
+                # On Windows, relpath raises ValueError if paths span different drive letters
+                rel_to_base = abs_target.replace("\\", "/")
+            return f"{prefix}{rel_to_base}"
+
+        return f"{prefix}{core_norm}"
+
+    @classmethod
+    def _canonicalize_scoped_line(cls, raw_line: str, current_dir: str, resolved_base_dir: str) -> str:
+        """
+        Canonicalizes any stack line (`<file>`, `random:`, `import:`, `remove:`, `replace:`)
+        so that `./` and `../` paths are anchored to `current_dir`.
+        """
+        clean = raw_line.strip()
+        if not clean or clean.startswith("#") or cls._is_import_marker(clean):
+            return raw_line
+        if clean.startswith("remove:"):
+            target = clean[len("remove:"):].strip()
+            if not target:
+                return clean
+            return f"remove:{cls._canonicalize_scoped_ref(target, current_dir, resolved_base_dir)}"
+        if clean.startswith("replace:"):
+            parts = clean[len("replace:"):].split("|", 1)
+            if len(parts) == 2:
+                old_p = parts[0].strip()
+                new_p = parts[1].strip()
+                if old_p and new_p:
+                    c_old = cls._canonicalize_scoped_ref(old_p, current_dir, resolved_base_dir)
+                    c_new = cls._canonicalize_scoped_ref(new_p, current_dir, resolved_base_dir)
+                    return f"replace:{c_old}|{c_new}"
+            return clean
+        return cls._canonicalize_scoped_ref(clean, current_dir, resolved_base_dir)
 
     @classmethod
     def _normalize_match(cls, p: str) -> str:
@@ -388,12 +501,17 @@ class PromptStackLoader:
         visited_stack_files: List[str] = None,
         apply_scope_modifiers: bool = False,
         log_unused: bool = True,
+        current_dir: str = None,
     ) -> List[str]:
         """
         Recursively expands `import:<relative_path>` directives in-place with subtree-scoped
-        modifier evaluation.
+        modifier evaluation and current-file-relative (`./` and `../`) path resolution.
 
         How nested scopes work:
+        0. Relative Coordinate Canonicalization: Any path starting with `./` or `../` inside
+           the current stack file is resolved relative to `current_dir` (that stack file's
+           directory) and translated into a `resolved_base_dir`-relative path. Paths without
+           leading `./` or `../` resolve directly against `resolved_base_dir`.
         1. Pre-Import Pass: Any modifier in the current scope that targets a direct `import:`
            line in the same scope (e.g., `remove:import:foo.txt` or `replace:import:foo.txt|...`)
            is applied before opening files from disk.
@@ -403,17 +521,17 @@ class PromptStackLoader:
            - `active_stack` (`os.path.realpath`) to prevent circular imports (`A -> A`, `A -> B -> A`)
              while allowing sequential non-cyclic reuse of the same snippet.
            - The 5MB file size limit.
-           Each imported file is resolved with `apply_scope_modifiers=True`, meaning its own
-           internal `remove:` and `replace:` commands only affect its own subtree and cannot
-           leak into sibling imports or later lines in the parent stack.
+           Each imported file is resolved with `apply_scope_modifiers=True` and
+           `current_dir=os.path.dirname(resolved_import)`, meaning its `./` and `../` paths
+           anchor to its own directory and its internal `remove:` and `replace:` commands only
+           affect its own subtree.
         3. Post-Import Pass: When `apply_scope_modifiers=True`, the current scope's remaining
            `remove:` and `replace:` modifiers are applied to the expanded lines of this scope.
-           When `apply_scope_modifiers=False` (used by `_resolve_paths` for the root scope),
-           the root scope's post-import modifiers are preserved at the end of the returned list
-           to be applied by `_build_final_file_list`.
         """
         if active_stack is None:
             active_stack = []
+        if current_dir is None:
+            current_dir = resolved_base_dir
 
         content_and_imports = []
         raw_modifier_lines = []
@@ -423,12 +541,13 @@ class PromptStackLoader:
             clean_line = line.strip()
             if not clean_line or clean_line.startswith("#") or cls._is_import_marker(clean_line):
                 continue
-            mod = cls._parse_modifier(clean_line)
+            scoped_line = cls._canonicalize_scoped_line(clean_line, current_dir, resolved_base_dir)
+            mod = cls._parse_modifier(scoped_line)
             if mod is not None:
-                raw_modifier_lines.append(clean_line)
+                raw_modifier_lines.append(scoped_line)
                 parsed_modifiers.append(mod)
             else:
-                content_and_imports.append(line)
+                content_and_imports.append(scoped_line)
 
         # Step 1: Pre-Import interception for modifiers targeting a direct `import:` line
         # in the current scope (avoids reading a removed/replaced stack file from disk).
@@ -514,6 +633,7 @@ class PromptStackLoader:
                 visited_stack_files=visited_stack_files,
                 apply_scope_modifiers=True,
                 log_unused=log_unused,
+                current_dir=os.path.dirname(resolved_import),
             )
             expanded.append(f"{cls._IMPORT_BEGIN_PREFIX}{norm_import_key}")
             expanded.extend(child_expanded)
@@ -551,9 +671,10 @@ class PromptStackLoader:
 
         raw_root_lines = []
         root_active_stack = []
+        root_current_dir = resolved_base_dir
         visited_stack_files = []
         if stack_file:
-            stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_file))
+            stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_file.strip().replace("\\", "/")))
             if _is_safe_path(node_root, stack_path) and os.path.exists(stack_path):
                 m.update(str(os.path.getmtime(stack_path)).encode("utf-8"))
                 try:
@@ -563,6 +684,8 @@ class PromptStackLoader:
                         with open(stack_path, "r", encoding="utf-8") as f:
                             raw_root_lines.extend(f.readlines())
                         root_active_stack.append(os.path.realpath(stack_path))
+                        if _is_safe_path(resolved_base_dir, stack_path):
+                            root_current_dir = os.path.dirname(stack_path)
                 except OSError:
                     pass
         if inline_stack:
@@ -575,6 +698,7 @@ class PromptStackLoader:
             visited_stack_files=visited_stack_files,
             apply_scope_modifiers=True,
             log_unused=False,
+            current_dir=root_current_dir,
         )
 
         for imp_path in visited_stack_files:
@@ -594,7 +718,7 @@ class PromptStackLoader:
                 else:
                     continue
             is_random = line.startswith("random:")
-            path_str = line[len("random:"):].strip() if is_random else line
+            path_str = (line[len("random:"):].strip() if is_random else line).replace("\\", "/")
 
             resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
 
@@ -610,7 +734,8 @@ class PromptStackLoader:
                             if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
                                 try:
                                     fpath = os.path.join(root, file)
-                                    m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
+                                    if _is_safe_path(resolved_base_dir, fpath):
+                                        m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
                                 except OSError:
                                     pass
         return m.hexdigest()
@@ -636,9 +761,10 @@ class PromptStackLoader:
         """
         raw_root_lines = []
         root_active_stack = []
+        root_current_dir = base_dir
         if stack_file:
             # Use the variable 'stack_path' for stack configuration files
-            stack_path = os.path.normpath(os.path.join(base_dir, stack_file))
+            stack_path = os.path.normpath(os.path.join(base_dir, stack_file.strip().replace("\\", "/")))
             node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             if not _is_safe_path(node_root, stack_path):
                 print(f"[Adaptive Prompts] Security Warning: stack_file '{stack_file}' attempts path traversal. Skipping.")
@@ -650,6 +776,8 @@ class PromptStackLoader:
                         with open(stack_path, "r", encoding="utf-8") as f:
                             raw_root_lines.extend(f.readlines())
                         root_active_stack.append(os.path.realpath(stack_path))
+                        if _is_safe_path(base_dir, stack_path):
+                            root_current_dir = os.path.dirname(stack_path)
                 except OSError as e:
                     print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
 
@@ -665,6 +793,7 @@ class PromptStackLoader:
             active_stack=root_active_stack,
             apply_scope_modifiers=True,
             log_unused=True,
+            current_dir=root_current_dir,
         )
 
     def _get_random_file(self, dir_path: str, rng: SeededRandom) -> str:
@@ -673,9 +802,11 @@ class PromptStackLoader:
             # Exclude "hidden" directories to avoid picking up overrides or drafts
             dirs[:] = [d for d in dirs if not (d.startswith('_') or d.startswith('.'))]
             for file in files:
-                # Exclude "hidden" files
+                # Exclude "hidden" files and verify each candidate does not escape via symlink
                 if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
-                    candidates.append(os.path.join(root, file))
+                    candidate = os.path.join(root, file)
+                    if _is_safe_path(dir_path, candidate):
+                        candidates.append(candidate)
         if candidates:
             candidates.sort() # Ensure deterministic order across different OSs
             return rng.choice(candidates)
@@ -716,7 +847,7 @@ class PromptStackLoader:
                 continue
 
             is_random = line.startswith("random:")
-            path_str = line[len("random:"):].strip() if is_random else line
+            path_str = (line[len("random:"):].strip() if is_random else line).replace("\\", "/")
 
             resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
             if not _is_safe_path(resolved_base_dir, resolved_path):

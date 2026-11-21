@@ -618,3 +618,205 @@ def test_import_modifier_combinations_targeting_and_replacing_with_import(tmp_pa
     files5 = loader._build_final_file_list(raw5, str(prompts_dir), SeededRandom(0))
     assert [os.path.basename(f) for f in files5] == ["end.txt"]
     assert "Circular import detected" in capsys.readouterr().out
+
+
+def test_import_current_file_relative_paths_and_nested_traversal(tmp_path, monkeypatch):
+    """
+    Verifies that `./` and `../` paths (in `import:`, normal file lines, `random:`,
+    `remove:`, and `replace:`) resolve relative to the directory of the stack file
+    where they are written, while paths without `./` or `../` resolve relative to `base_dir`.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    # Global preset at base_dir/stacks/global_preset.stack.txt
+    stacks_dir = prompts_dir / "stacks"
+    stacks_dir.mkdir()
+    (prompts_dir / "global_item.txt").write_text("global", encoding="utf-8")
+    (stacks_dir / "global_preset.stack.txt").write_text("global_item.txt\n", encoding="utf-8")
+
+    # Deep project structure: base_dir/projects/group/scene/phase/
+    scene_dir = prompts_dir / "projects" / "group" / "scene"
+    phase_dir = scene_dir / "phase"
+    local_pool = phase_dir / "local_pool"
+    local_pool.mkdir(parents=True)
+
+    (scene_dir / "scene_init.txt").write_text("scene init", encoding="utf-8")
+    (scene_dir / "scene_extra.txt").write_text("scene extra", encoding="utf-8")
+    (phase_dir / "local_prompt.txt").write_text("local prompt", encoding="utf-8")
+    (phase_dir / "alt_prompt.txt").write_text("alt prompt", encoding="utf-8")
+    (local_pool / "pool_only.txt").write_text("pool item", encoding="utf-8")
+
+    # scene/_scene_base.stack.txt uses `./` relative to `scene/` and base-root `stacks/...`
+    (scene_dir / "_scene_base.stack.txt").write_text(
+        "import:stacks/global_preset.stack.txt\n"
+        "./scene_init.txt\n"
+        "./scene_extra.txt\n",
+        encoding="utf-8",
+    )
+
+    # phase/_phase_base.stack.txt imports `../_scene_base.stack.txt` and uses `./` relative to `phase/`
+    (phase_dir / "_phase_base.stack.txt").write_text(
+        "import:../_scene_base.stack.txt\n"
+        "./local_prompt.txt\n"
+        "random:./local_pool\n",
+        encoding="utf-8",
+    )
+
+    # phase/01.stack.txt imports `./_phase_base.stack.txt` and uses relative `replace:` and `remove:`
+    (phase_dir / "01.stack.txt").write_text(
+        "import:./_phase_base.stack.txt\n"
+        "replace:./local_prompt.txt|./alt_prompt.txt\n"
+        "remove:../scene_extra.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+    raw_lines = loader._resolve_paths(
+        str(prompts_dir),
+        "projects/group/scene/phase/01.stack.txt",
+        "",
+    )
+    files = loader._build_final_file_list(raw_lines, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == [
+        "global_item.txt",
+        "scene_init.txt",
+        "alt_prompt.txt",
+        "pool_only.txt",
+    ]
+
+
+def test_import_relative_path_security_cannot_escape_base_dir(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that `../` relative paths inside deeply nested stack files (or inside
+    an external `stack_file` outside `base_dir`) can never escape `resolved_base_dir`.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    project_a = prompts_dir / "arch" / "project_a"
+    deep_dir = project_a / "sub1" / "sub2"
+    deep_dir.mkdir(parents=True)
+
+    project_b = prompts_dir / "arch" / "project_b"
+    project_b.mkdir(parents=True)
+    (project_b / "secret.stack.txt").write_text("secret.txt\n", encoding="utf-8")
+    (project_b / "secret.txt").write_text("secret", encoding="utf-8")
+
+    (deep_dir / "valid.txt").write_text("valid", encoding="utf-8")
+    (deep_dir / "leaf.stack.txt").write_text(
+        "import:../../../project_b/secret.stack.txt\n"
+        "../../../project_b/secret.txt\n"
+        "./valid.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+    resolved_base = loader._resolve_base_dir("prompts/arch/project_a")
+
+    raw = loader._resolve_paths(resolved_base, "sub1/sub2/leaf.stack.txt", "")
+    files = loader._build_final_file_list(raw, resolved_base, SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == ["valid.txt"]
+    out = capsys.readouterr().out
+    assert "Security Warning:" in out
+
+
+def test_cross_platform_backslash_and_slash_interoperability(tmp_path, monkeypatch):
+    """
+    Verifies that Windows-style backslashes (`\\`) and POSIX forward slashes (`/`)
+    can be freely mixed across `stack_file`, `import:`, regular file paths, `random:`,
+    `remove:`, and `replace:` (including `.\\` and `..\\` relative paths).
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    stacks_dir = prompts_dir / "stacks"
+    scene_dir = prompts_dir / "projects" / "scene"
+    sub_dir = scene_dir / "sub"
+    pool_dir = sub_dir / "pool"
+    stacks_dir.mkdir(parents=True)
+    pool_dir.mkdir(parents=True)
+
+    (prompts_dir / "global_a.txt").write_text("ga", encoding="utf-8")
+    (stacks_dir / "preset.stack.txt").write_text("global_a.txt\n", encoding="utf-8")
+    (scene_dir / "parent_item.txt").write_text("pi", encoding="utf-8")
+    (scene_dir / "remove_me.txt").write_text("rm", encoding="utf-8")
+    (sub_dir / "local_old.txt").write_text("old", encoding="utf-8")
+    (sub_dir / "local_new.txt").write_text("new", encoding="utf-8")
+    (pool_dir / "rand_item.txt").write_text("ri", encoding="utf-8")
+
+    (scene_dir / "_parent.stack.txt").write_text(
+        "import:stacks\\preset.stack.txt\n"
+        ".\\parent_item.txt\n"
+        ".\\remove_me.txt\n",
+        encoding="utf-8",
+    )
+
+    (sub_dir / "01.stack.txt").write_text(
+        "import:..\\_parent.stack.txt\n"
+        ".\\local_old.txt\n"
+        "random:.\\pool\n"
+        "replace:.\\local_old.txt|.\\local_new.txt\n"
+        "remove:..\\remove_me.txt\n",
+        encoding="utf-8",
+    )
+
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "projects\\scene\\sub\\01.stack.txt", "")
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == [
+        "global_a.txt",
+        "parent_item.txt",
+        "local_new.txt",
+        "rand_item.txt",
+    ]
+
+
+def test_classical_cross_platform_security_hazards(tmp_path, monkeypatch):
+    """
+    Tests classical cross-platform path security hazards:
+    1. Symlink inside a `random:` directory pointing outside `base_dir`.
+    2. Windows reserved device names (`CON.txt`, `AUX.txt`, `NUL.txt`, `COM1.txt`, `LPT1.txt`).
+    3. Windows drive-relative paths (`C:secret.txt`, `C:\\secret.txt`) and NTFS
+       Alternate Data Streams (`valid.txt:$DATA`, `valid.txt:hidden`).
+    4. Null-byte injection (`valid.txt\\x00`).
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_secret = outside_dir / "outside_secret.txt"
+    outside_secret.write_text("leaked secret", encoding="utf-8")
+
+    # 1. Symlink inside a valid `random:` directory pointing outside `base_dir`
+    pool_dir = prompts_dir / "random_pool"
+    pool_dir.mkdir()
+    os.symlink(outside_secret, pool_dir / "escaped_link.txt")
+
+    # Create files with names that would be dangerous on Windows/NTFS if allowed
+    (prompts_dir / "valid.txt").write_text("safe", encoding="utf-8")
+
+    inline_stack = "\n".join([
+        "random:random_pool",
+        "import:CON.txt",
+        "CON.txt",
+        "sub/AUX.txt",
+        "NUL.txt",
+        "COM1.txt",
+        "LPT9.txt",
+        "import:C:secret.txt",
+        "C:secret.txt",
+        "C:\\secret.txt",
+        "valid.txt:$DATA",
+        "valid.txt:hidden_stream.txt",
+        "valid.txt\x00.txt",
+        "valid.txt",
+    ])
+
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "", inline_stack)
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+
+    # Only `valid.txt` is allowed; the symlinked file in `random_pool` and all
+    # device/ADS/drive/null-byte paths are blocked.
+    assert [os.path.basename(f) for f in files] == ["valid.txt"]

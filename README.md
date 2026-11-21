@@ -60,7 +60,10 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
 - **`inline_stack`**: A multiline text field used to define paths, import snippets, or apply on-the-fly overrides directly within the node.
 - **`override_context`**: Determines how incoming context is handled: **Merge** (appends new variables) or **Override** (replaces existing variables).
 
-> **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths. Relative paths are always resolved against your defined `base_dir`. Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed. Symlinks that point outside the `base_dir` are strictly forbidden, and files exceeding 5MB are automatically skipped.
+> **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths (absolute paths like `/etc/passwd` or `C:\...` are blocked). Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed:
+> - **Base-Directory Relative (default):** Paths without a leading `./` or `../` (e.g., `modules/lighting/sunny.txt` or `import:stacks/presets/day.txt`) always resolve from your defined `base_dir`.
+> - **Current-File Relative (`./` and `../`):** Paths starting with `./` or `../` inside a stack file (e.g., `import:./_base.stack.txt`, `import:../_common.stack.txt`, or `./local_override.txt`) resolve relative to **that stack file's own directory**, so you don't need to re-type long project paths for sibling files.
+> - **Strict Sandbox:** Both base-relative and current-file-relative paths are strictly constrained to `base_dir`—any `../` traversal or symlink that resolves outside `base_dir` is strictly forbidden, and files exceeding 5MB are automatically skipped.
 
 ---
 
