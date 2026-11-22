@@ -924,6 +924,41 @@ def test_security_dag_import_bomb_and_replace_amplification_dos(tmp_path, monkey
     assert "Maximum expanded stack lines" in capsys.readouterr().out
 
 
+def test_modifier_count_budget_prevents_cpu_dos(tmp_path, monkeypatch, capsys):
+    """
+    Each `remove:`/`replace:` is a linear pass over the expanded lines, so an unbounded
+    number of modifiers (e.g., 100k lines pasted into `inline_stack`) would make
+    resolution O(M * N) and stall the server. Verifies the MAX_TOTAL_MODIFIERS budget
+    caps applied modifiers, absent targets are skipped cheaply, and in-budget modifiers
+    still apply in written order.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    for name in ("a", "b", "c"):
+        (prompts_dir / f"{name}.txt").write_text(name, encoding="utf-8")
+
+    loader = PromptStackLoader()
+
+    # 1. In-budget modifiers still chain in written order.
+    raw = loader._resolve_paths(str(prompts_dir), "", "a.txt\nb.txt\nreplace:a.txt|c.txt\nremove:b.txt")
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files] == ["c.txt"]
+    capsys.readouterr()
+
+    # 2. Huge numbers of non-matching and alternating matching modifiers stay bounded.
+    flood = "\n".join(
+        ["a.txt"] * 2000
+        + [f"remove:missing_{i}.txt" for i in range(20000)]
+        + ["replace:a.txt|b.txt", "replace:b.txt|a.txt"] * 5000
+    )
+    start = time.time()
+    raw_flood = loader._resolve_paths(str(prompts_dir), "", flood)
+    PromptStackLoader.IS_CHANGED("", "", flood)
+    elapsed = time.time() - start
+    assert "Maximum total modifiers" in capsys.readouterr().out
+    assert elapsed < 20
+    assert len(raw_flood) == 2000
+
+
 def test_security_windows_pre_realpath_unc_device_and_drive_relative(tmp_path, monkeypatch):
     """
     Verifies that `_is_safe_path`, `_resolve_base_dir`, and `stack_file` block UNC paths,

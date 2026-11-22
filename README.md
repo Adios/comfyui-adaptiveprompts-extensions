@@ -86,8 +86,13 @@ Because `import:` directives are resolved bottom-up, `replace:` and `remove:` ca
 
 - **`replace:<old_path>|<new_path>`** — Swaps a matching line (or entire `import:` block) in-place while preserving its exact position in the execution order.
   - Works on standard file paths, `random:` lines, and `import:` directives (e.g., `replace:lighting/sunny.txt|lighting/rainy.txt`, `replace:random:anime|anime/frieren/frieren.txt`, `replace:lighting/sunny.txt|import:stacks/presets/complex_lighting.txt`, or `replace:import:stacks/presets/day.txt|import:stacks/presets/night.txt`).
+  - **Failed Replacement Targets:** If a replacement payload is invalid, missing, or blocked (including a failed, circular, or out-of-bounds `replace:...|import:<stack>`), the original target line is still removed rather than preserved.
 - **`remove:<file_path>`** — Excludes a matching line or entire `import:` block from being loaded (e.g., `remove:styles/cyberpunk.txt` or `remove:import:stacks/presets/extra.txt`).
   - Because `<lora:...>` tags are always accumulated across the stack and ignore the **Override** toggle, `remove:` is the primary way to exclude a file containing an unwanted LoRA.
+- **Scoping, Execution Order & Limits:**
+  - **Subtree & `stack_file` Scoping:** Modifiers inside an imported stack or inside `stack_file` apply only within their own scope—they do not leak out to sibling imports or to `inline_stack` (while `inline_stack` modifiers can still target lines and `import:` blocks loaded by `stack_file`).
+  - **Sequential Execution:** Within a scope, modifiers apply one after another in written order against the evolving stack (not simultaneously against the original lines). Chaining works (`replace:a.txt|b.txt` then `replace:b.txt|c.txt` yields `c.txt`), the first matching `replace:` wins (`replace:a.txt|b.txt` then `replace:a.txt|c.txt` yields `b.txt`), and two-way swaps (`replace:a.txt|b.txt` then `replace:b.txt|a.txt`) produce `a.txt, a.txt` rather than exchanging positions.
+  - **Modifier Budget:** At most 256 modifiers are applied per run across all scopes; any beyond that are skipped with a console warning.
 
 ##### 3. Comments & Hidden Overrides
 

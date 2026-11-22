@@ -361,6 +361,10 @@ class PromptStackLoader:
     MAX_IMPORT_DEPTH = 32
     MAX_TOTAL_IMPORTS = 512
     MAX_EXPANDED_LINES = 10000
+    # Each modifier is a linear pass over up to MAX_EXPANDED_LINES lines, so the total
+    # number of applied modifiers must be bounded to keep the cost O(MAX_TOTAL_MODIFIERS * N)
+    # instead of letting a huge `inline_stack` / stack file stall the server (CPU DoS).
+    MAX_TOTAL_MODIFIERS = 256
     _IMPORT_BEGIN_PREFIX = "__ps_begin_import__:"
     _IMPORT_END_PREFIX = "__ps_end_import__:"
 
@@ -368,8 +372,10 @@ class PromptStackLoader:
     def _new_expansion_budget(cls) -> dict:
         return {
             "imports": 0,
+            "modifiers": 0,
             "import_limit_warned": False,
             "line_limit_warned": False,
+            "modifier_limit_warned": False,
         }
 
     @classmethod
@@ -552,8 +558,46 @@ class PromptStackLoader:
         if budget is None:
             budget = cls._new_expansion_budget()
 
+        # Memoize line normalization across passes: `os.path.normpath` per line per
+        # modifier would otherwise dominate the cost of every pass.
+        norm_cache = {}
+
+        def _match_key(stripped_line: str) -> str:
+            key = norm_cache.get(stripped_line)
+            if key is None:
+                key = cls._normalize_match(stripped_line)
+                norm_cache[stripped_line] = key
+            return key
+
+        def _present_keys(line_list):
+            keys = set()
+            for line_item in line_list:
+                s = line_item.strip()
+                keys.add(s if cls._is_import_marker(s) else _match_key(s))
+            return keys
+
         current_lines = list(lines)
+        present = None
         for mod_type, target_key, new_path in modifiers:
+            if budget.get("modifiers", 0) >= cls.MAX_TOTAL_MODIFIERS:
+                if not budget.get("modifier_limit_warned"):
+                    print(f"[Adaptive Prompts] Warning: Maximum total modifiers ({cls.MAX_TOTAL_MODIFIERS}) exceeded. Skipping remaining 'remove:'/'replace:' directives.")
+                    budget["modifier_limit_warned"] = True
+                break
+            budget["modifiers"] = budget.get("modifiers", 0) + 1
+
+            # Fast path: a modifier whose target is absent cannot change the lines, so
+            # skip the O(N) rebuild (the key set is only recomputed after a match).
+            if present is None:
+                present = _present_keys(current_lines)
+            if target_key not in present and f"{cls._IMPORT_BEGIN_PREFIX}{target_key}" not in present:
+                if log_unused:
+                    if mod_type == "remove":
+                        print(f"[Adaptive Prompts] Debug: Exclusion target '{target_key}' did not match any loaded paths.")
+                    elif mod_type == "replace":
+                        print(f"[Adaptive Prompts] Debug: Swap target '{target_key}' -> '{new_path}' did not match any loaded paths.")
+                continue
+
             matched = False
             next_lines = []
             replacement_payload = None
@@ -615,7 +659,7 @@ class PromptStackLoader:
 
                     # Case B: Matches an unexpanded `import:` line directly
                     is_marker = cls._is_import_marker(stripped)
-                    if not is_marker and cls._normalize_match(stripped) == target_key:
+                    if not is_marker and _match_key(stripped) == target_key:
                         matched = True
                         if mod_type == "replace":
                             _append_replacement()
@@ -628,7 +672,7 @@ class PromptStackLoader:
                     if cls._is_import_marker(stripped):
                         _append_existing(item, True)
                         continue
-                    if cls._normalize_match(stripped) == target_key:
+                    if _match_key(stripped) == target_key:
                         matched = True
                         if mod_type == "replace":
                             _append_replacement()
@@ -642,6 +686,8 @@ class PromptStackLoader:
                     print(f"[Adaptive Prompts] Debug: Swap target '{target_key}' -> '{new_path}' did not match any loaded paths.")
 
             current_lines = next_lines
+            if matched:
+                present = None
 
         return current_lines
 
