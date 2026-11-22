@@ -38,7 +38,8 @@ By leveraging this node, you can transition your workflow into a highly adaptabl
 
 #### Key Features
 *   **Sequential File Processing:** Load and evaluate a list of text files (a "stack") in order. File paths can be relative or specifically pull a random file from a directory.
-*   **Dynamic Stack Modifiers:** Use inline commands like `remove:path/to/file.txt` or `replace:old_path|new_path` to surgically alter a master stack template without changing the underlying files.
+*   **Modular Stack Composition (`import:`):** Break monolithic stacks into reusable building blocks (headers, footers, subject setups) and import them on demand—eliminating multi-node loader chains and copy-paste drift.
+*   **Dynamic Stack Modifiers (`replace:`, `remove:`):** Surgically swap or exclude specific lines in-place across your stack (including lines pulled in via `import:`) without editing the underlying files.
 *   **Hidden Files & Local Overrides:** Any file or directory starting with `_` or `.` is completely hidden from the randomizer. This allows you to safely store specialized states or drafts (e.g., `_explicit_override.txt`) alongside your main prompts, loading them only when you explicitly ask for them!
 *   **Automatic LoRA Tag Extraction:** Any `<lora:name:weight>` tags found within your stacked files are automatically extracted and compiled into a clean `lora_string` output to be sent directly to a LoRA Tag Loader.
 *   **Context Accumulation & Overrides:** As files are processed, variables are collected into a `context` dictionary. You can pass context between multiple Stack Loaders, using the **Override** toggle to cleanly re-roll specific elements (like a character's expression) while keeping the rest of the generation state identical.
@@ -47,7 +48,7 @@ For a deeper dive into the **Architecture Philosophy** and ready-to-use template
 
 A ready-to-use example workflow is also available: **[Prompt Stack Loader Three Scenes Pipeline](workflow/PromptStackLoaderThreeScenesPipeline.json)**.
 
-#### Node Parameters & Stack Syntax
+#### Node Parameters
 
 - **`base_dir`**: The foundational directory for resolving file paths.
   - **Empty:** Resolves to the `prompts` directory within this extension's folder.
@@ -55,21 +56,48 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
     - **Allowed:** `subfolder/file.txt`, `subfolder/../file.txt` (stays inside `base_dir`)
     - **Blocked:** `C:\file.txt`, `/etc/passwd`, `../../outside_file.txt` (escapes `base_dir`)
     Symlinks pointing outside the base directory are blocked, and files exceeding 5MB are skipped.
-- **`stack_file`**: The path to a `.txt` file containing your execution stack (e.g., `stacks/illustrious.txt`). *(Note: Unlike the paths inside the stack, this file is allowed to use `../` to escape your `base_dir`, as long as it remains inside the extension folder).*
-- **`inline_stack`**: A multiline text field used to define paths or apply on-the-fly overrides directly within the node.
+- **`stack_file`**: The path to a `.txt` file containing your execution stack (e.g., `stacks/illustrious.txt`). *(Note: Unlike the paths inside the stack, this top-level parameter is allowed to use `../` to escape your `base_dir`, as long as it remains inside the extension folder).*
+- **`inline_stack`**: A multiline text field used to define paths, import snippets, or apply on-the-fly overrides directly within the node.
 - **`override_context`**: Determines how incoming context is handled: **Merge** (appends new variables) or **Override** (replaces existing variables).
 
-> **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths. Relative paths are always resolved against your defined `base_dir`. Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed. Symlinks that point outside the `base_dir` are strictly forbidden, and files exceeding 5MB are automatically skipped.
+> **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths (absolute paths like `/etc/passwd` or `C:\...` are blocked). Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed:
+> - **Base-Directory Relative (default):** Paths without a leading `./` or `../` (e.g., `modules/lighting/sunny.txt` or `import:stacks/presets/day.txt`) always resolve from your defined `base_dir`.
+> - **Current-File Relative (`./` and `../`):** Paths starting with `./` or `../` inside a stack file (e.g., `import:./_base.stack.txt`, `import:../_common.stack.txt`, or `./local_override.txt`) resolve relative to **that stack file's own directory**, so you don't need to re-type long project paths for sibling files.
+> - **Strict Sandbox:** Both base-relative and current-file-relative paths are strictly constrained to `base_dir`—any `../` traversal or symlink that resolves outside `base_dir` is strictly forbidden, and files exceeding 5MB are automatically skipped.
 
-**Inline Stack Commands:**
-Each line within a stack acts as an instruction. Alongside standard file paths, you can use the following commands to modify the stack dynamically right from the node:
-- `random:folder_path` -> Selects a random `.txt` file from the specified directory (includes subfolders). *(Note: Files and folders starting with `_` or `.` are ignored).*
-- `remove:file_path` -> Excludes a specific file from being loaded (e.g., `remove:styles/cyberpunk.txt`). Because LoRA tags are always accumulated across the stack and ignore the **Override** toggle, excluding the file that contains the LoRA is the primary way to prevent it from being merged into your final `lora_string` output.
-- `replace:old_file|new_file` -> Swaps a file in-place, allowing targeted modifications without editing the original stack file. 
-  - e.g., `replace:lighting/sunny.txt|lighting/rainy.txt` or `replace:random:anime|anime/frieren/frieren.txt`.
+---
 
-**Local Overrides & Hidden Files:**
-A powerful workflow technique is to prefix files or directories with `_` or `.` (e.g., `_action_pose.txt` or `_WIP`). Because these are ignored by the randomizer, they won't randomly appear in your generations. However, you can still load them *explicitly* by writing their exact path in your stack (e.g., `anime/neon_genesis_evangelion/_asuka_override.txt`). This makes managing complex "Context Override" modes much cleaner, as your base options and their specific overrides can live safely in the exact same directory without interfering with each other.
+#### 📜 Stack Commands Reference
+
+Each line in a `stack_file` or `inline_stack` acts as an instruction. Commands are processed in a two-stage pipeline: **Stage 1** recursively expands all `import:` directives in-place, and **Stage 2** applies `remove:` and `replace:` modifiers before resolving `random:` directories.
+
+##### 1. Composition & Selection Commands
+
+- **`import:<stack_path>`** — Recursively includes another stack file in-place at the exact position of the `import:` line.
+  - **Strict `base_dir` Sandbox:** Unlike the node's top-level `stack_file` input, `import:` is strictly constrained to the node's resolved `base_dir`. For example, if `base_dir` is set to `prompt_examples/arch/illustrious`, `import:` can only load files inside `prompt_examples/arch/illustrious` (escaping via `../`, absolute paths, or symlinks pointing outside `base_dir` are blocked, and files >5MB are skipped).
+  - **Cycle & Depth Protection:** The loader tracks the active import chain (`A -> B -> A`) and enforces a maximum nesting depth of 32. Circular imports (direct self-imports, mutual cycles, or symlink loops) are automatically skipped with a console warning, while importing the same snippet twice sequentially in the same stack is allowed and evaluated in order.
+  - **Subtree-Scoped Modifiers:** Any `remove:` or `replace:` written *inside* an imported stack file only modifies that file's own subtree—it will never leak out to affect sibling imports or lines added later in the parent stack.
+- **`random:<folder_path>`** — Selects a deterministic random `.txt` file from the specified directory (including subfolders) using the node's `seed`.
+  - Files and directories starting with `_` or `.` are automatically ignored by the randomizer.
+
+##### 2. Stack Modifier Commands
+
+Because `import:` directives are resolved bottom-up, `replace:` and `remove:` can target local lines, lines originating inside any imported stack file, or even an entire `import:` block itself:
+
+- **`replace:<old_path>|<new_path>`** — Swaps a matching line (or entire `import:` block) in-place while preserving its exact position in the execution order.
+  - Works on standard file paths, `random:` lines, and `import:` directives (e.g., `replace:lighting/sunny.txt|lighting/rainy.txt`, `replace:random:anime|anime/frieren/frieren.txt`, `replace:lighting/sunny.txt|import:stacks/presets/complex_lighting.txt`, or `replace:import:stacks/presets/day.txt|import:stacks/presets/night.txt`).
+  - **Failed Replacement Targets:** If a replacement payload is invalid, missing, or blocked (including a failed, circular, or out-of-bounds `replace:...|import:<stack>`), the original target line is still removed rather than preserved.
+- **`remove:<file_path>`** — Excludes a matching line or entire `import:` block from being loaded (e.g., `remove:styles/cyberpunk.txt` or `remove:import:stacks/presets/extra.txt`).
+  - Because `<lora:...>` tags are always accumulated across the stack and ignore the **Override** toggle, `remove:` is the primary way to exclude a file containing an unwanted LoRA.
+- **Scoping, Execution Order & Limits:**
+  - **Subtree & `stack_file` Scoping:** Modifiers inside an imported stack or inside `stack_file` apply only within their own scope—they do not leak out to sibling imports or to `inline_stack` (while `inline_stack` modifiers can still target lines and `import:` blocks loaded by `stack_file`).
+  - **Sequential Execution:** Within a scope, modifiers apply one after another in written order against the evolving stack (not simultaneously against the original lines). Chaining works (`replace:a.txt|b.txt` then `replace:b.txt|c.txt` yields `c.txt`), the first matching `replace:` wins (`replace:a.txt|b.txt` then `replace:a.txt|c.txt` yields `b.txt`), and two-way swaps (`replace:a.txt|b.txt` then `replace:b.txt|a.txt`) produce `a.txt, a.txt` rather than exchanging positions.
+  - **Modifier Budget:** At most 256 modifiers are applied per run across all scopes; any beyond that are skipped with a console warning.
+
+##### 3. Comments & Hidden Overrides
+
+- **`# <comment>`** — Lines starting with `#` are ignored (including commented-out commands like `#import:stacks/draft.txt`).
+- **Hidden Files (`_file.txt`, `_folder/`)** — Prefixing files or directories with `_` or `.` hides them from `random:<folder_path>` while still allowing you to load them *explicitly* by path (e.g., `anime/evangelion/_asuka_override.txt`).
 
 #### Node Outputs
 
@@ -112,6 +140,45 @@ Later in the same stack (or in a separate downstream Stack Loader), you load an 
 ---
 
 ## 💡 Pro Tips & Advanced Workflows
+
+### 🧱 Modular Stack Composition: Combining `import:` with `replace:` & `remove:`
+
+Instead of chaining multiple `PromptStackLoader` nodes in your ComfyUI graph (e.g., Root Loader → Intermediate Loader → Leaf Loader) or copy-pasting boilerplate headers and footers across dozens of scene stacks, you can compose scenes declaratively using `import:`.
+
+Because `import:` directives are recursively expanded **before** `replace:` and `remove:` are evaluated, you can store common style presets, environment setups, or rendering footers in a shared `stacks/` folder and surgically tweak individual lines per scene.
+
+**Example: Shared Preset Snippet (`stacks/presets/watercolor_daylight.txt`)**
+```text
+negatives/default.txt
+aesthetics/base/noobai/default.txt
+aesthetics/background/watercolor.txt
+lighting/sunny.txt
+finishes/cinematic.txt
+finishes/film_grain.txt
+```
+
+**Example: Scene Stack (`scenes/rainy_cafe.txt`)**
+Suppose this specific scene wants the same base preset, except it takes place in the rain (`lighting/rainy.txt` instead of `lighting/sunny.txt`) and wants a clean render without `finishes/film_grain.txt`:
+
+```text
+# 1. Load subject and pull in the shared style preset
+anime/frieren/frieren.txt
+import:stacks/presets/watercolor_daylight.txt
+
+# 2. Surgically customize the imported preset in-place
+replace:lighting/sunny.txt|lighting/rainy.txt
+remove:finishes/film_grain.txt
+
+# 3. Add scene-specific outfit, expression, and background
+outfits/winter_coat.txt
+expressions/melancholic.txt
+backgrounds/urban/cafe_window.txt
+```
+
+**Why this works so well:**
+* **In-Place Ordering Preserved:** `replace:` swaps `lighting/sunny.txt` for `lighting/rainy.txt` at its exact original position inside the imported preset, ensuring downstream files that depend on earlier variables see the updated state in the right order.
+* **Zero Copy-Paste Drift:** Shared boilerplate lives in one place (`stacks/presets/`), while individual scene files stay compact and self-contained.
+* **Security & Cycle Safety:** Every `import:` path is strictly sandboxed to the node's `base_dir` (it cannot escape `base_dir` via `../` or symlinks) and protected against circular imports (`A -> B -> A`).
 
 ### 🔗 Chained Loaders & Global States
 

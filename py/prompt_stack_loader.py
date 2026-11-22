@@ -100,20 +100,140 @@ except AttributeError:
         return _resolve_wildcards(prompt, rng, wildcard_dir, _resolved_vars=resolved_vars)
 
 # --- Context Helper Functions ---
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "COM\u00b9", "COM\u00b2", "COM\u00b3",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
+})
+
+
+def _is_device_namespace_path(path: str) -> bool:
+    """Returns True for Windows device namespace paths (`\\\\.\\...`, `\\\\?\\...`, `//./...`, `//?/...`)."""
+    norm = path.replace("\\", "/")
+    return norm.startswith("//./") or norm.startswith("//?/") or norm in ("//.", "//?")
+
+
+def _is_unc_path(path: str) -> bool:
+    """Returns True for UNC network paths (`\\\\server\\share`, `//server/share`, or mixed `/\\`)."""
+    return path.replace("\\", "/").startswith("//")
+
+
+def _unc_share_root(path: str) -> str:
+    """Extracts normalized `//server/share` prefix for UNC comparison, or empty string."""
+    norm = path.replace("\\", "/")
+    if not norm.startswith("//"):
+        return ""
+    parts = [p for p in norm[2:].split("/") if p]
+    if len(parts) < 2:
+        return ""
+    return f"//{parts[0].lower()}/{parts[1].lower()}"
+
+
+def _is_drive_relative_path(path: str) -> bool:
+    """Returns True for Windows drive-relative paths like `C:foo.txt` or bare `C:` (no slash after colon)."""
+    return len(path) >= 2 and path[1] == ":" and (len(path) == 2 or path[2] not in ("/", "\\"))
+
+
+def _has_unsafe_relative_segments(rel_path: str) -> bool:
+    """Checks a forward-slash relative path for colons or Windows reserved device names."""
+    if ":" in rel_path:
+        return True
+    for segment in rel_path.split("/"):
+        if not segment or segment in (".", ".."):
+            continue
+        stem = segment.split(".", 1)[0].rstrip(" .").strip().upper()
+        if stem in _WINDOWS_RESERVED_NAMES:
+            return True
+    return False
+
+
+def _is_safe_relative_ref(path_str: str) -> bool:
+    """
+    Validates that a path written inside a stack file or `inline_stack` is strictly
+    relative (never absolute, UNC, drive-qualified, ADS, null-byte, or reserved-device).
+    Checked BEFORE `os.path.join` so Windows `ntpath.join` cannot silently strip
+    same-drive prefixes (`C:file.txt`) or discard `base_dir` for absolute/UNC paths.
+    """
+    if not path_str or "\x00" in path_str or ":" in path_str:
+        return False
+    norm = path_str.replace("\\", "/")
+    if norm.startswith("/"):
+        return False
+    return not _has_unsafe_relative_segments(norm)
+
+
+def _path_in_active_stack(candidate: str, active_stack: List[str]) -> bool:
+    """
+    Returns True if `candidate` refers to the same file as any entry in `active_stack`.
+    Uses normalized `realpath` plus `os.path.samefile` so cycles via symlinks,
+    hard links, and case-insensitive filesystems (macOS APFS / Windows) are all caught.
+    """
+    norm_candidate = os.path.normcase(os.path.realpath(candidate))
+    for active in active_stack:
+        if os.path.normcase(active) == norm_candidate:
+            return True
+        try:
+            if os.path.samefile(candidate, active):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _is_safe_path(base: str, path: str) -> bool:
     """
-    Validates that `path` is securely contained within `base`.
-    
-    This function prevents path traversal (e.g., using `../../`) and arbitrary file 
-    read vulnerabilities. It fully resolves all symlinks via `os.path.realpath` 
-    to ensure that symlink-based evasion attacks cannot escape the sandbox boundary.
-    It returns True if the path is safe, and False if it attempts to escape.
+    Validates that `path` is securely contained within `base` across all platforms.
+
+    Defends against:
+    1. Path traversal (`../../`) and symlink escapes via `os.path.realpath`.
+    2. Case-insensitive filesystem mismatches (Windows/macOS) via `os.path.normcase`.
+    3. Null-byte injection (`\\x00`).
+    4. UNC paths (`\\\\server\\share`, `//server/share`) and Windows device namespaces
+       (`\\\\.\\`, `\\\\?\\`) BEFORE calling `os.path.realpath` (prevents SMB/NTLM leaks
+       and device-open hangs on Windows).
+    5. Windows drive-relative paths (`C:foo.txt`) and NTFS Alternate Data Streams
+       (`file.txt:$DATA` or `file.txt:stream`) via colon rejection in relative subpaths.
+    6. Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
+       `COM1`-`COM9`, `LPT1`-`LPT9`, superscript variants, with or without extensions or
+       trailing spaces/dots) checked BEFORE `os.path.realpath`.
     """
+    if not base or not path or "\x00" in base or "\x00" in path:
+        return False
+    if _is_device_namespace_path(base) or _is_device_namespace_path(path):
+        return False
+    if _is_drive_relative_path(base) or _is_drive_relative_path(path):
+        return False
+    if _is_unc_path(path):
+        if not _is_unc_path(base):
+            return False
+        base_share = _unc_share_root(base)
+        path_share = _unc_share_root(path)
+        if not base_share or base_share != path_share:
+            return False
     try:
+        # Lexical pre-check BEFORE `os.path.realpath` so Windows never opens reserved
+        # device names (e.g., `CON.txt`) or ADS streams during handle resolution.
+        abs_base = os.path.abspath(base)
+        abs_path = os.path.abspath(path)
+        raw_tail = os.path.relpath(abs_path, abs_base).replace("\\", "/")
+        if _has_unsafe_relative_segments(raw_tail):
+            return False
+
         real_base = os.path.realpath(base)
         real_path = os.path.realpath(path)
-        return os.path.commonpath([real_base, real_path]) == real_base
-    except ValueError:
+        norm_base = os.path.normcase(real_base)
+        norm_path = os.path.normcase(real_path)
+        if os.path.commonpath([norm_base, norm_path]) != norm_base:
+            return False
+
+        rel_subpath = os.path.relpath(real_path, real_base).replace("\\", "/")
+        if _has_unsafe_relative_segments(rel_subpath):
+            return False
+
+        return True
+    except (ValueError, OSError):
         return False
 
 def _ensure_bucket_dict(bucket_like):
@@ -161,16 +281,16 @@ DEFAULT_PROMPT_ROOT = os.path.abspath(
 class PromptStackLoader:
     """
     Sequentially loads, parses, and evaluates a stack of text files to build a complex prompt and context.
-    
+
     This node acts as a batch processor that orchestrates prompt generation across multiple files:
-    1. It resolves file paths, processes inline commands (remove:, replace:, random:), and collects a final list of files.
+    1. It resolves file paths, expands nested stack imports (import:), processes inline commands (remove:, replace:, random:), and collects a final list of files.
     2. For each file, it extracts and isolates LoRA tags (`<lora:...>`) directly from the raw string.
-    3. It delegates the remaining text to the core evaluation logic to cleanly handle wildcards, 
+    3. It delegates the remaining text to the core evaluation logic to cleanly handle wildcards,
        comment blocks (`##...##`), and formatting.
-    4. Variables defined in one file (context) are accumulated and sequentially merged (or overridden) 
+    4. Variables defined in one file (context) are accumulated and sequentially merged (or overridden)
        into the next, allowing complex cross-file prompt building.
     """
-    
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -184,19 +304,19 @@ class PromptStackLoader:
                     "tooltip": "Optional. Path to a .txt file containing your stack. Relative paths (e.g., 'stacks/my_stack.txt') resolve against base_dir."
                 }),
                 "inline_stack": ("STRING", {
-                    "multiline": True, 
+                    "multiline": True,
                     "default": "",
-                    "tooltip": "List of text paths to load sequentially (relative resolve against base_dir).\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
+                    "tooltip": "List of text paths to load sequentially (relative resolve against base_dir).\n- Use 'import:path' to include another stack file.\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
                 }),
                 "override_context": ("BOOLEAN", {
-                    "default": False, 
-                    "label_on": "Override", 
+                    "default": False,
+                    "label_on": "Override",
                     "label_off": "Merge",
                     "tooltip": "Override: New variables replace old ones. Merge: New variables are combined into existing buckets."
                 }),
                 "seed": ("INT", {
-                    "default": 0, 
-                    "min": 0, 
+                    "default": 0,
+                    "min": 0,
                     "max": 0xffffffffffffffff,
                     "tooltip": "Controls the random file selection for 'random:' paths and internal wildcards."
                 }),
@@ -212,82 +332,681 @@ class PromptStackLoader:
     def _resolve_base_dir(cls, base_dir: str) -> str:
         """
         Resolves the user's `base_dir` input into an absolute path and validates it.
-        
-        Security: The `base_dir` establishes the foundational sandbox for all internal 
-        stack lines (e.g., character traits or replacements). It is strictly validated 
+
+        Security: The `base_dir` establishes the foundational sandbox for all internal
+        stack lines (e.g., character traits or replacements). It is strictly validated
         to ensure it does not escape the overall extension folder (`node_root`).
         If it fails the security check, it safely defaults to the 'prompts' folder.
         """
-        resolved_base_dir = base_dir.strip()
+        raw_base_dir = base_dir.strip()
         node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        if not resolved_base_dir:
+        if not raw_base_dir:
             resolved_base_dir = os.path.join(node_root, "prompts")
+        elif (
+            "\x00" in raw_base_dir
+            or _is_device_namespace_path(raw_base_dir)
+            or _is_unc_path(raw_base_dir)
+            or _is_drive_relative_path(raw_base_dir)
+        ):
+            print(f"[Adaptive Prompts] Security Warning: base_dir '{base_dir}' attempts path traversal. Defaulting to 'prompts'.")
+            return os.path.join(node_root, "prompts")
         else:
-            resolved_base_dir = os.path.normpath(os.path.join(node_root, resolved_base_dir))
-            
+            resolved_base_dir = os.path.normpath(os.path.join(node_root, raw_base_dir.replace("\\", "/")))
+
         if not _is_safe_path(node_root, resolved_base_dir):
             print(f"[Adaptive Prompts] Security Warning: base_dir '{base_dir}' attempts path traversal. Defaulting to 'prompts'.")
             resolved_base_dir = os.path.join(node_root, "prompts")
         return resolved_base_dir
 
+    MAX_IMPORT_DEPTH = 32
+    MAX_TOTAL_IMPORTS = 512
+    MAX_EXPANDED_LINES = 10000
+    # Each modifier is a linear pass over up to MAX_EXPANDED_LINES lines, so the total
+    # number of applied modifiers must be bounded to keep the cost O(MAX_TOTAL_MODIFIERS * N)
+    # instead of letting a huge `inline_stack` / stack file stall the server (CPU DoS).
+    MAX_TOTAL_MODIFIERS = 256
+    _IMPORT_BEGIN_PREFIX = "__ps_begin_import__:"
+    _IMPORT_END_PREFIX = "__ps_end_import__:"
+
+    @classmethod
+    def _new_expansion_budget(cls) -> dict:
+        return {
+            "imports": 0,
+            "modifiers": 0,
+            "import_limit_warned": False,
+            "line_limit_warned": False,
+            "modifier_limit_warned": False,
+        }
+
+    @classmethod
+    def _is_current_dir_relative(cls, path_str: str) -> bool:
+        """
+        Returns True if `path_str` is explicitly relative to the current stack file's
+        directory (starts with `./` or `../`, or is `.` / `..`).
+        Paths without a leading `./` or `../` resolve relative to `resolved_base_dir`.
+        """
+        norm_slashes = path_str.strip().replace("\\", "/")
+        return (
+            norm_slashes == "."
+            or norm_slashes == ".."
+            or norm_slashes.startswith("./")
+            or norm_slashes.startswith("../")
+        )
+
+    @classmethod
+    def _canonicalize_scoped_ref(cls, ref_str: str, current_dir: str, resolved_base_dir: str) -> str:
+        """
+        Resolves a file reference, `random:<dir>`, or `import:<stack>` that starts with
+        `./` or `../` against `current_dir` (the directory of the stack file where the
+        line is written) and converts it into a `resolved_base_dir`-relative path with
+        normalized forward slashes for cross-platform compatibility.
+
+        Security: This function only translates relative coordinates; it does NOT grant
+        access. Any path that resolves outside `resolved_base_dir` retains a leading
+        `../` relative to `resolved_base_dir` and is strictly blocked by `_is_safe_path`.
+        """
+        s = ref_str.strip()
+        prefix = ""
+        core = s
+        for pfx in ("random:", "import:"):
+            if s.startswith(pfx):
+                prefix = pfx
+                core = s[len(pfx):].strip()
+                break
+
+        if not core:
+            return prefix
+
+        if "\x00" in core or ":" in core:
+            return f"{prefix}{core}"
+
+        core_norm = core.replace("\\", "/")
+        if current_dir and cls._is_current_dir_relative(core_norm):
+            abs_target = os.path.normpath(os.path.join(current_dir, core_norm))
+            try:
+                rel_to_base = os.path.relpath(abs_target, resolved_base_dir).replace("\\", "/")
+            except ValueError:
+                # On Windows, relpath raises ValueError if paths span different drive letters
+                rel_to_base = abs_target.replace("\\", "/")
+            return f"{prefix}{rel_to_base}"
+
+        return f"{prefix}{core_norm}"
+
+    @classmethod
+    def _canonicalize_scoped_line(cls, raw_line: str, current_dir: str, resolved_base_dir: str) -> str:
+        """
+        Canonicalizes any stack line (`<file>`, `random:`, `import:`, `remove:`, `replace:`)
+        so that `./` and `../` paths are anchored to `current_dir`.
+        """
+        clean = raw_line.strip()
+        if not clean or clean.startswith("#") or cls._is_import_marker(clean):
+            return raw_line
+        if clean.startswith("remove:"):
+            target = clean[len("remove:"):].strip()
+            if not target:
+                return clean
+            return f"remove:{cls._canonicalize_scoped_ref(target, current_dir, resolved_base_dir)}"
+        if clean.startswith("replace:"):
+            parts = clean[len("replace:"):].split("|", 1)
+            if len(parts) == 2:
+                old_p = parts[0].strip()
+                new_p = parts[1].strip()
+                if old_p and new_p:
+                    c_old = cls._canonicalize_scoped_ref(old_p, current_dir, resolved_base_dir)
+                    c_new = cls._canonicalize_scoped_ref(new_p, current_dir, resolved_base_dir)
+                    return f"replace:{c_old}|{c_new}"
+            return clean
+        return cls._canonicalize_scoped_ref(clean, current_dir, resolved_base_dir)
+
+    @classmethod
+    def _normalize_match(cls, p: str) -> str:
+        """
+        Normalizes slashes and redundant relative segments (e.g., `./`) for
+        cross-platform matching across file paths, `random:`, and `import:`.
+        """
+        p = p.strip()
+        if not p:
+            return ""
+        for prefix in ("random:", "import:"):
+            if p.startswith(prefix):
+                core = p[len(prefix):].strip().replace("\\", "/")
+                if not core:
+                    return prefix
+                core = os.path.normpath(core).replace("\\", "/")
+                return f"{prefix}{core}"
+        return os.path.normpath(p.replace("\\", "/")).replace("\\", "/")
+
+    @classmethod
+    def _is_modifier_line(cls, clean_line: str) -> bool:
+        return clean_line.startswith("remove:") or clean_line.startswith("replace:")
+
+    @classmethod
+    def _parse_modifier(cls, clean_line: str):
+        """
+        Parses a `remove:<target>` or `replace:<old>|<new>` line into a tuple
+        `(mod_type, normalized_target_key, new_path_or_none)`, or returns None
+        if the line is not a valid modifier command.
+
+        Security: Rejects internal import boundary markers, nested modifier prefixes
+        (`remove:`, `replace:`), and comments as targets or replacement payloads to
+        prevent marker spoofing and second-stage modifier injection.
+        """
+        if clean_line.startswith("remove:"):
+            path_to_exclude = clean_line[len("remove:"):].strip()
+            if (
+                not path_to_exclude
+                or path_to_exclude.startswith("#")
+                or cls._is_import_marker(path_to_exclude)
+                or cls._is_modifier_line(path_to_exclude)
+            ):
+                return None
+            return ("remove", cls._normalize_match(path_to_exclude), None)
+        if clean_line.startswith("replace:"):
+            parts = clean_line[len("replace:"):].split("|", 1)
+            if len(parts) == 2:
+                old_path = parts[0].strip()
+                new_path = parts[1].strip()
+                if (
+                    old_path
+                    and new_path
+                    and not old_path.startswith("#")
+                    and not new_path.startswith("#")
+                    and not cls._is_import_marker(old_path)
+                    and not cls._is_import_marker(new_path)
+                    and not cls._is_modifier_line(old_path)
+                    and not cls._is_modifier_line(new_path)
+                ):
+                    return ("replace", cls._normalize_match(old_path), new_path)
+            return None
+        return None
+
+    @classmethod
+    def _is_import_marker(cls, line: str) -> bool:
+        return line.startswith(cls._IMPORT_BEGIN_PREFIX) or line.startswith(cls._IMPORT_END_PREFIX)
+
+    @classmethod
+    def _apply_modifiers_to_lines(
+        cls,
+        lines: List[str],
+        modifiers: List[Tuple[str, str, str]],
+        resolved_base_dir: str,
+        active_stack: List[str] = None,
+        visited_stack_files: List[str] = None,
+        expand_replacement_imports: bool = True,
+        log_unused: bool = True,
+        budget: dict = None,
+    ) -> List[str]:
+        """
+        Applies `remove:` and `replace:` modifiers sequentially to `lines`.
+
+        Supported combinations:
+        1. File / `random:` targets (`remove:a.txt`, `replace:a.txt|b.txt`, `replace:random:dir|a.txt`):
+           Matches individual lines in-place.
+        2. Replacing a line with an `import:` (`replace:a.txt|import:sub.stack.txt`):
+           Lazily expands the replacement `import:` on first match with full sandbox,
+           cycle, depth, and resource-budget checks.
+        3. Targeting an `import:` directive (`remove:import:sub.stack.txt`,
+           `replace:import:sub.stack.txt|import:alt.stack.txt`, `replace:import:sub.stack.txt|a.txt`):
+           Matches either an unexpanded `import:` line or the entire block of lines
+           produced by an expanded `import:` (delimited by internal begin/end markers).
+        4. Self-replacement (`replace:a.txt|a.txt`) and round-trip swaps (`a -> b` then `b -> a`):
+           Each modifier executes in a single linear pass over `current_lines`, so self-swaps
+           and round-trip swaps terminate in O(N) without infinite loops.
+        """
+        if active_stack is None:
+            active_stack = []
+        if budget is None:
+            budget = cls._new_expansion_budget()
+
+        # Memoize line normalization across passes: `os.path.normpath` per line per
+        # modifier would otherwise dominate the cost of every pass.
+        norm_cache = {}
+
+        def _match_key(stripped_line: str) -> str:
+            key = norm_cache.get(stripped_line)
+            if key is None:
+                key = cls._normalize_match(stripped_line)
+                norm_cache[stripped_line] = key
+            return key
+
+        def _present_keys(line_list):
+            keys = set()
+            for line_item in line_list:
+                s = line_item.strip()
+                keys.add(s if cls._is_import_marker(s) else _match_key(s))
+            return keys
+
+        current_lines = list(lines)
+        present = None
+        for mod_type, target_key, new_path in modifiers:
+            if budget.get("modifiers", 0) >= cls.MAX_TOTAL_MODIFIERS:
+                if not budget.get("modifier_limit_warned"):
+                    print(f"[Adaptive Prompts] Warning: Maximum total modifiers ({cls.MAX_TOTAL_MODIFIERS}) exceeded. Skipping remaining 'remove:'/'replace:' directives.")
+                    budget["modifier_limit_warned"] = True
+                break
+            budget["modifiers"] = budget.get("modifiers", 0) + 1
+
+            # Fast path: a modifier whose target is absent cannot change the lines, so
+            # skip the O(N) rebuild (the key set is only recomputed after a match).
+            if present is None:
+                present = _present_keys(current_lines)
+            if target_key not in present and f"{cls._IMPORT_BEGIN_PREFIX}{target_key}" not in present:
+                if log_unused:
+                    if mod_type == "remove":
+                        print(f"[Adaptive Prompts] Debug: Exclusion target '{target_key}' did not match any loaded paths.")
+                    elif mod_type == "replace":
+                        print(f"[Adaptive Prompts] Debug: Swap target '{target_key}' -> '{new_path}' did not match any loaded paths.")
+                continue
+
+            matched = False
+            next_lines = []
+            replacement_payload = None
+
+            def _get_replacement_payload():
+                nonlocal replacement_payload
+                if replacement_payload is not None:
+                    return replacement_payload
+                if expand_replacement_imports and new_path.strip().startswith("import:"):
+                    replacement_payload = cls._expand_import_lines(
+                        [new_path],
+                        resolved_base_dir,
+                        active_stack=active_stack,
+                        visited_stack_files=visited_stack_files,
+                        apply_scope_modifiers=True,
+                        log_unused=log_unused,
+                        budget=budget,
+                    )
+                else:
+                    replacement_payload = [new_path]
+                return replacement_payload
+
+            def _append_replacement():
+                payload = _get_replacement_payload()
+                if len(next_lines) + len(payload) <= cls.MAX_EXPANDED_LINES:
+                    next_lines.extend(payload)
+                elif not budget["line_limit_warned"]:
+                    print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
+                    budget["line_limit_warned"] = True
+
+            def _append_existing(item_line: str, is_marker: bool):
+                if is_marker or len(next_lines) < cls.MAX_EXPANDED_LINES:
+                    next_lines.append(item_line)
+                elif not budget["line_limit_warned"]:
+                    print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
+                    budget["line_limit_warned"] = True
+
+            if target_key.startswith("import:"):
+                begin_tag = f"{cls._IMPORT_BEGIN_PREFIX}{target_key}"
+                end_tag = f"{cls._IMPORT_END_PREFIX}{target_key}"
+                block_depth = 0
+
+                for item in current_lines:
+                    stripped = item.strip()
+                    # Case A: Matches an already-expanded inner import block via boundary markers
+                    if stripped == begin_tag:
+                        if block_depth == 0:
+                            matched = True
+                            if mod_type == "replace":
+                                _append_replacement()
+                        block_depth += 1
+                        continue
+                    if stripped == end_tag:
+                        if block_depth > 0:
+                            block_depth -= 1
+                            continue
+                    if block_depth > 0:
+                        continue
+
+                    # Case B: Matches an unexpanded `import:` line directly
+                    is_marker = cls._is_import_marker(stripped)
+                    if not is_marker and _match_key(stripped) == target_key:
+                        matched = True
+                        if mod_type == "replace":
+                            _append_replacement()
+                        continue
+
+                    _append_existing(item, is_marker)
+            else:
+                for item in current_lines:
+                    stripped = item.strip()
+                    if cls._is_import_marker(stripped):
+                        _append_existing(item, True)
+                        continue
+                    if _match_key(stripped) == target_key:
+                        matched = True
+                        if mod_type == "replace":
+                            _append_replacement()
+                    else:
+                        _append_existing(item, False)
+
+            if not matched and log_unused:
+                if mod_type == "remove":
+                    print(f"[Adaptive Prompts] Debug: Exclusion target '{target_key}' did not match any loaded paths.")
+                elif mod_type == "replace":
+                    print(f"[Adaptive Prompts] Debug: Swap target '{target_key}' -> '{new_path}' did not match any loaded paths.")
+
+            current_lines = next_lines
+            if matched:
+                present = None
+
+        return current_lines
+
+    @classmethod
+    def _expand_import_lines(
+        cls,
+        raw_lines: List[str],
+        resolved_base_dir: str,
+        active_stack: List[str] = None,
+        visited_stack_files: List[str] = None,
+        apply_scope_modifiers: bool = False,
+        log_unused: bool = True,
+        current_dir: str = None,
+        prefix_lines: List[str] = None,
+        budget: dict = None,
+    ) -> List[str]:
+        """
+        Recursively expands `import:<relative_path>` directives in-place with subtree-scoped
+        modifier evaluation and current-file-relative (`./` and `../`) path resolution.
+
+        How nested scopes work:
+        1. Sanitization & Relative Coordinate Canonicalization: User lines are stripped of
+           comments, blank lines, and spoofed internal markers. Any path starting with `./`
+           or `../` is resolved relative to `current_dir` (that stack file's directory) and
+           translated into a `resolved_base_dir`-relative path. Paths without leading `./`
+           or `../` resolve directly against `resolved_base_dir`.
+        2. Recursive Import Pass: Each `import:` line is validated against:
+           - `_is_safe_relative_ref(...)` to reject absolute/UNC/drive/ADS/reserved paths.
+           - `MAX_IMPORT_DEPTH` (32) and `MAX_TOTAL_IMPORTS` (512) / `MAX_EXPANDED_LINES`
+             (10000) to prevent recursion errors and exponential DAG amplification DoS.
+           - `_is_safe_path(resolved_base_dir, ...)` to enforce the `base_dir` sandbox.
+           - `_path_in_active_stack(...)` to prevent circular imports (`A -> A`, `A -> B -> A`,
+             symlink loops, hard-link loops, and case-insensitive FS cycles) while allowing
+             sequential non-cyclic reuse of the same snippet.
+           - The 5MB file size limit.
+           Each imported file is resolved with `apply_scope_modifiers=True` and
+           `current_dir=os.path.dirname(resolved_import)`, meaning its `./` and `../` paths
+           anchor to its own directory and its internal `remove:` and `replace:` commands only
+           affect its own subtree.
+        3. Post-Import Modifier Pass: When `apply_scope_modifiers=True`, the current scope's
+           `remove:` and `replace:` modifiers execute in exact written order over the expanded
+           lines (including any trusted `prefix_lines` and both direct and nested imports).
+        """
+        if active_stack is None:
+            active_stack = []
+        if current_dir is None:
+            current_dir = resolved_base_dir
+        if budget is None:
+            budget = cls._new_expansion_budget()
+
+        content_and_imports = []
+        raw_modifier_lines = []
+        parsed_modifiers = []
+
+        for line in raw_lines:
+            clean_line = line.strip()
+            if not clean_line or clean_line.startswith("#") or cls._is_import_marker(clean_line):
+                continue
+            scoped_line = cls._canonicalize_scoped_line(clean_line, current_dir, resolved_base_dir)
+            if cls._is_modifier_line(scoped_line):
+                mod = cls._parse_modifier(scoped_line)
+                if mod is not None:
+                    raw_modifier_lines.append(scoped_line)
+                    parsed_modifiers.append(mod)
+                else:
+                    print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
+            else:
+                content_and_imports.append(scoped_line)
+
+        # Step 1: Start from any already-expanded trusted prefix lines (e.g., from stack_file)
+        # and expand all `import:` lines in-place.
+        expanded = list(prefix_lines) if prefix_lines else []
+        for line in content_and_imports:
+            clean_line = line.strip()
+            if not clean_line.startswith("import:"):
+                if len(expanded) < cls.MAX_EXPANDED_LINES:
+                    expanded.append(line)
+                elif not budget["line_limit_warned"]:
+                    print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
+                    budget["line_limit_warned"] = True
+                continue
+
+            import_target = clean_line[len("import:"):].strip().replace("\\", "/")
+            if not import_target:
+                print("[Adaptive Prompts] Warning: Empty 'import:' directive. Skipping.")
+                continue
+
+            if len(active_stack) >= cls.MAX_IMPORT_DEPTH:
+                print(f"[Adaptive Prompts] Warning: Maximum import depth ({cls.MAX_IMPORT_DEPTH}) exceeded at '{import_target}'. Skipping.")
+                continue
+
+            if not _is_safe_relative_ref(import_target):
+                print(f"[Adaptive Prompts] Security Warning: import '{import_target}' attempts path traversal. Skipping.")
+                continue
+
+            resolved_import = os.path.normpath(os.path.join(resolved_base_dir, import_target))
+            if not _is_safe_path(resolved_base_dir, resolved_import):
+                print(f"[Adaptive Prompts] Security Warning: import '{import_target}' attempts path traversal. Skipping.")
+                continue
+
+            if not os.path.isfile(resolved_import):
+                print(f"[Adaptive Prompts] Warning: Imported stack file '{resolved_import}' is not a valid file. Skipping.")
+                continue
+
+            real_import = os.path.realpath(resolved_import)
+            if _path_in_active_stack(real_import, active_stack):
+                print(f"[Adaptive Prompts] Warning: Circular import detected for '{import_target}'. Skipping.")
+                continue
+
+            if budget["imports"] >= cls.MAX_TOTAL_IMPORTS:
+                if not budget["import_limit_warned"]:
+                    print(f"[Adaptive Prompts] Warning: Maximum total import expansions ({cls.MAX_TOTAL_IMPORTS}) exceeded at '{import_target}'. Skipping remaining imports.")
+                    budget["import_limit_warned"] = True
+                continue
+
+            if len(expanded) >= cls.MAX_EXPANDED_LINES:
+                if not budget["line_limit_warned"]:
+                    print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
+                    budget["line_limit_warned"] = True
+                continue
+
+            try:
+                if os.path.getsize(resolved_import) > 5 * 1024 * 1024:
+                    print(f"[Adaptive Prompts] Warning: File '{resolved_import}' exceeds 5MB limit. Skipping.")
+                    continue
+                with open(resolved_import, "r", encoding="utf-8-sig") as f:
+                    imported_lines = f.readlines()
+            except (OSError, UnicodeDecodeError) as e:
+                print(f"[Adaptive Prompts] Warning: Could not read imported stack file '{resolved_import}': {e}")
+                continue
+
+            budget["imports"] += 1
+            if visited_stack_files is not None and resolved_import not in visited_stack_files:
+                visited_stack_files.append(resolved_import)
+
+            norm_import_key = cls._normalize_match(clean_line)
+            child_expanded = cls._expand_import_lines(
+                imported_lines,
+                resolved_base_dir,
+                active_stack=active_stack + [real_import],
+                visited_stack_files=visited_stack_files,
+                apply_scope_modifiers=True,
+                log_unused=log_unused,
+                current_dir=os.path.dirname(resolved_import),
+                budget=budget,
+            )
+            if len(expanded) + len(child_expanded) + 2 <= cls.MAX_EXPANDED_LINES:
+                expanded.append(f"{cls._IMPORT_BEGIN_PREFIX}{norm_import_key}")
+                expanded.extend(child_expanded)
+                expanded.append(f"{cls._IMPORT_END_PREFIX}{norm_import_key}")
+            elif not budget["line_limit_warned"]:
+                print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
+                budget["line_limit_warned"] = True
+
+        # Step 2: Apply this scope's modifiers in exact written order to the expanded lines.
+        if apply_scope_modifiers:
+            return cls._apply_modifiers_to_lines(
+                expanded,
+                parsed_modifiers,
+                resolved_base_dir,
+                active_stack=active_stack,
+                visited_stack_files=visited_stack_files,
+                expand_replacement_imports=True,
+                log_unused=log_unused,
+                budget=budget,
+            )
+
+        return expanded + raw_modifier_lines
+
+    @classmethod
+    def _resolve_root_lines(
+        cls,
+        resolved_base_dir: str,
+        stack_file: str,
+        inline_stack: str,
+        visited_stack_files: List[str] = None,
+        log_unused: bool = True,
+        log_stack_warnings: bool = True,
+    ) -> List[str]:
+        """
+        Shared root-level stack resolution for both `_resolve_paths()` and `IS_CHANGED()`.
+
+        Evaluates `stack_file` in its own subtree scope (so its `./` and `../` paths
+        anchor to `stack_file`'s own directory when inside `resolved_base_dir`, and its
+        internal `remove:`/`replace:` modifiers do not leak onto `inline_stack`), then
+        evaluates `inline_stack` as an outer scope anchored to `resolved_base_dir` that
+        can still modify lines and `import:` blocks produced by `stack_file`.
+        """
+        node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        budget = cls._new_expansion_budget()
+        stack_expanded = []
+
+        if stack_file:
+            raw_stack_file = stack_file.strip()
+            if (
+                "\x00" in raw_stack_file
+                or _is_device_namespace_path(raw_stack_file)
+                or _is_unc_path(raw_stack_file)
+                or _is_drive_relative_path(raw_stack_file)
+            ):
+                if log_stack_warnings:
+                    print(f"[Adaptive Prompts] Security Warning: stack_file '{stack_file}' attempts path traversal. Skipping.")
+            else:
+                stack_path = os.path.normpath(os.path.join(resolved_base_dir, raw_stack_file.replace("\\", "/")))
+                if not _is_safe_path(node_root, stack_path):
+                    if log_stack_warnings:
+                        print(f"[Adaptive Prompts] Security Warning: stack_file '{stack_file}' attempts path traversal. Skipping.")
+                elif os.path.isfile(stack_path):
+                    if visited_stack_files is not None and stack_path not in visited_stack_files:
+                        visited_stack_files.append(stack_path)
+                    try:
+                        if os.path.getsize(stack_path) > 5 * 1024 * 1024:
+                            if log_stack_warnings:
+                                print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping.")
+                            else:
+                                print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping read in IS_CHANGED.")
+                        else:
+                            with open(stack_path, "r", encoding="utf-8-sig") as f:
+                                stack_raw_lines = f.readlines()
+                            stack_current_dir = (
+                                os.path.dirname(stack_path)
+                                if _is_safe_path(resolved_base_dir, stack_path)
+                                else resolved_base_dir
+                            )
+                            stack_expanded = cls._expand_import_lines(
+                                stack_raw_lines,
+                                resolved_base_dir,
+                                active_stack=[os.path.realpath(stack_path)],
+                                visited_stack_files=visited_stack_files,
+                                apply_scope_modifiers=True,
+                                log_unused=log_unused,
+                                current_dir=stack_current_dir,
+                                budget=budget,
+                            )
+                    except (OSError, UnicodeDecodeError) as e:
+                        if log_stack_warnings:
+                            print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
+                elif log_stack_warnings:
+                    print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': not a valid file.")
+
+        if inline_stack:
+            return cls._expand_import_lines(
+                inline_stack.splitlines(),
+                resolved_base_dir,
+                active_stack=[],
+                visited_stack_files=visited_stack_files,
+                apply_scope_modifiers=True,
+                log_unused=log_unused,
+                current_dir=resolved_base_dir,
+                prefix_lines=stack_expanded,
+                budget=budget,
+            )
+
+        return stack_expanded
+
     @classmethod
     def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
         import hashlib
-        import os
         m = hashlib.sha256()
-        
+
         resolved_base_dir = cls._resolve_base_dir(base_dir)
-        node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
         config_path = os.path.join(adaptive_prompts_dir, "config.json")
         if os.path.isfile(config_path):
             try:
-                m.update(str(os.path.getmtime(config_path)).encode("utf-8"))
+                m.update(f"cfg:{os.path.getmtime(config_path)}\0".encode("utf-8"))
             except OSError:
                 pass
 
-        paths = []
-        if stack_file:
-            stack_path = os.path.normpath(os.path.join(resolved_base_dir, stack_file))
-            if _is_safe_path(node_root, stack_path) and os.path.exists(stack_path):
-                m.update(str(os.path.getmtime(stack_path)).encode("utf-8"))
-                try:
-                    if os.path.getsize(stack_path) > 5 * 1024 * 1024:
-                        print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping read in IS_CHANGED.")
-                    else:
-                        with open(stack_path, "r", encoding="utf-8") as f:
-                            paths.extend(f.readlines())
-                except OSError:
-                    pass
-        if inline_stack:
-            paths.extend(inline_stack.splitlines())
-            
+        visited_stack_files = []
+        paths = cls._resolve_root_lines(
+            resolved_base_dir,
+            stack_file,
+            inline_stack,
+            visited_stack_files=visited_stack_files,
+            log_unused=False,
+            log_stack_warnings=False,
+        )
+
+        for imp_path in visited_stack_files:
+            try:
+                m.update(f"stack:{imp_path}:{os.path.getmtime(imp_path)}\0".encode("utf-8"))
+            except OSError:
+                pass
+
         for line in paths:
             line = line.strip()
-            if not line or line.startswith("#") or line.startswith("remove:") or line.startswith("replace:"):
+            if not line or line.startswith("#") or cls._is_import_marker(line) or cls._is_modifier_line(line):
                 continue
             is_random = line.startswith("random:")
-            path_str = line[len("random:"):].strip() if is_random else line
-            
+            path_str = (line[len("random:"):].strip() if is_random else line).replace("\\", "/")
+            if not path_str or not _is_safe_relative_ref(path_str):
+                continue
+
             resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
-            
-            if _is_safe_path(resolved_base_dir, resolved_path) and os.path.exists(resolved_path):
-                if not os.path.isdir(resolved_path):
-                    m.update(str(os.path.getmtime(resolved_path)).encode("utf-8"))
-                else:
-                    for root, dirs, files in os.walk(resolved_path):
-                        # Filter out "hidden" directories (used for local overrides/drafts)
-                        dirs[:] = [d for d in dirs if not (d.startswith('_') or d.startswith('.'))]
-                        for file in files:
-                            # Filter out "hidden" files so they don't trigger cache invalidation
-                            if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
-                                try:
-                                    fpath = os.path.join(root, file)
-                                    m.update(str(os.path.getmtime(fpath)).encode("utf-8"))
-                                except OSError:
-                                    pass
+
+            if not _is_safe_path(resolved_base_dir, resolved_path):
+                continue
+
+            if is_random and os.path.isdir(resolved_path):
+                for root, dirs, files in os.walk(resolved_path):
+                    # Filter out "hidden" directories (used for local overrides/drafts)
+                    dirs[:] = sorted(d for d in dirs if not (d.startswith('_') or d.startswith('.')))
+                    for file in sorted(files):
+                        # Filter out "hidden" files so they don't trigger cache invalidation
+                        if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
+                            try:
+                                fpath = os.path.join(root, file)
+                                if _is_safe_path(resolved_path, fpath) and os.path.isfile(fpath):
+                                    m.update(f"rand:{fpath}:{os.path.getmtime(fpath)}\0".encode("utf-8"))
+                            except OSError:
+                                pass
+            elif not is_random and os.path.isfile(resolved_path):
+                try:
+                    m.update(f"file:{resolved_path}:{os.path.getmtime(resolved_path)}\0".encode("utf-8"))
+                except OSError:
+                    pass
         return m.hexdigest()
-        
+
     RETURN_TYPES = ("STRING", "DICT", "STRING")
     RETURN_NAMES = ("prompt", "context", "lora_string")
     FUNCTION = "process"
@@ -295,37 +1014,26 @@ class PromptStackLoader:
 
     def _resolve_paths(self, base_dir: str, stack_file: str, inline_stack: str) -> List[str]:
         """
-        Resolves and loads the contents of the `stack_file` and `inline_stack`.
-        
-        Security Exception: The `stack_file` itself acts as an orchestrator and may 
-        legitimately live outside the `base_dir` (e.g., in a sibling 'stacks' folder). 
-        Therefore, `stack_file` is sandboxed against the broader `node_root` (the 
-        extension directory), NOT the `base_dir`. 
-        
-        However, the internal lines parsed *from* the stack file remain strictly 
-        sandboxed against the `base_dir` during the final file resolution phase.
-        """
-        paths = []
-        if stack_file:
-            # Use the variable 'stack_path' for stack configuration files
-            stack_path = os.path.normpath(os.path.join(base_dir, stack_file))
-            node_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            if not _is_safe_path(node_root, stack_path):
-                print(f"[Adaptive Prompts] Security Warning: stack_file '{stack_file}' attempts path traversal. Skipping.")
-            else:
-                try:
-                    if os.path.getsize(stack_path) > 5 * 1024 * 1024:
-                        print(f"[Adaptive Prompts] Warning: File '{stack_path}' exceeds 5MB limit. Skipping.")
-                    else:
-                        with open(stack_path, "r", encoding="utf-8") as f:
-                            paths.extend(f.readlines())
-                except OSError as e:
-                    print(f"[Adaptive Prompts] Warning: Could not read stack file '{stack_path}': {e}")
+        Resolves and loads the contents of the `stack_file` and `inline_stack`,
+        recursively expanding any `import:` directives in-place.
 
-        if inline_stack:
-            paths.extend(inline_stack.splitlines())
-            
-        return paths
+        Security Exception: The `stack_file` itself acts as an orchestrator and may
+        legitimately live outside the `base_dir` (e.g., in a sibling 'stacks' folder).
+        Therefore, `stack_file` is sandboxed against the broader `node_root` (the
+        extension directory), NOT the `base_dir`.
+
+        However, the internal lines parsed *from* the stack file (including `import:`
+        directives) remain strictly sandboxed against the `base_dir` during the final
+        file resolution phase.
+        """
+        return self._resolve_root_lines(
+            base_dir,
+            stack_file,
+            inline_stack,
+            visited_stack_files=None,
+            log_unused=True,
+            log_stack_warnings=True,
+        )
 
     def _get_random_file(self, dir_path: str, rng: SeededRandom) -> str:
         candidates = []
@@ -333,100 +1041,82 @@ class PromptStackLoader:
             # Exclude "hidden" directories to avoid picking up overrides or drafts
             dirs[:] = [d for d in dirs if not (d.startswith('_') or d.startswith('.'))]
             for file in files:
-                # Exclude "hidden" files
+                # Exclude "hidden" files and verify each candidate is a regular file within dir_path
                 if file.endswith(".txt") and not (file.startswith('_') or file.startswith('.')):
-                    candidates.append(os.path.join(root, file))
+                    candidate = os.path.join(root, file)
+                    if _is_safe_path(dir_path, candidate) and os.path.isfile(candidate):
+                        candidates.append(candidate)
         if candidates:
             candidates.sort() # Ensure deterministic order across different OSs
             return rng.choice(candidates)
         return ""
 
     def _build_final_file_list(self, raw_lines: List[str], resolved_base_dir: str, rng: SeededRandom) -> List[str]:
-        def _normalize_match(p: str) -> str:
-            # Normalizes slashes and redundant ./ for cross-platform string matching.
-            is_rand = p.startswith("random:")
-            core = p[7:].strip() if is_rand else p
-            core = os.path.normpath(core).replace("\\", "/")
-            return f"random:{core}" if is_rand else core
-        
-        # Pass 1 (Identify Modifiers)
-        exclusions = set()
-        swaps = {}
+        # Separate content lines and any remaining unapplied modifiers (e.g., if
+        # `_build_final_file_list` is invoked directly with raw lines in tests).
+        content_lines = []
+        modifiers = []
         for line in raw_lines:
             clean_line = line.strip()
-            if clean_line.startswith("remove:"):
-                path_to_exclude = clean_line[7:].strip()
-                if path_to_exclude:
-                    exclusions.add(_normalize_match(path_to_exclude))
-            elif clean_line.startswith("replace:"):
-                # Slice off 'replace:' and split by the first pipe
-                parts = clean_line[8:].split("|", 1)
-                if len(parts) == 2:
-                    old_path = parts[0].strip()
-                    new_path = parts[1].strip()
-                    if old_path and new_path:
-                        swaps[_normalize_match(old_path)] = new_path
+            if not clean_line or clean_line.startswith("#"):
+                continue
+            if self._is_modifier_line(clean_line):
+                mod = self._parse_modifier(clean_line)
+                if mod is not None:
+                    modifiers.append(mod)
+                else:
+                    print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
+            else:
+                content_lines.append(clean_line)
 
-        # Pass 2 (Filter and Swap the Stack)
-        valid_lines = []
-        unused_exclusions = exclusions.copy()
-        unused_swaps = set(swaps.keys())
-        
-        for line in raw_lines:
-            clean_line = line.strip()
-            # Skip empty lines, comments, and the modifier commands themselves
-            if not clean_line or clean_line.startswith("#") or clean_line.startswith("remove:") or clean_line.startswith("replace:"):
-                continue
-                
-            match_key = _normalize_match(clean_line)
-                
-            # Handle Exclusions
-            if match_key in exclusions:
-                if match_key in unused_exclusions:
-                    unused_exclusions.remove(match_key)
-                continue
-                
-            # Handle Swaps
-            if match_key in swaps:
-                valid_lines.append(swaps[match_key])
-                if match_key in unused_swaps:
-                    unused_swaps.remove(match_key)
-                continue
-                
-            # If not modified, keep the original line
-            valid_lines.append(line)
-
-        # Pass 3 (Typo Check / Debug Warning)
-        for unused in unused_exclusions:
-            print(f"[Adaptive Prompts] Debug: Exclusion target '{unused}' did not match any loaded paths.")
-        for unused in unused_swaps:
-            print(f"[Adaptive Prompts] Debug: Swap target '{unused}' -> '{swaps[unused]}' did not match any loaded paths.")
+        if modifiers:
+            valid_lines = self._apply_modifiers_to_lines(
+                content_lines,
+                modifiers,
+                resolved_base_dir,
+                active_stack=[],
+                expand_replacement_imports=True,
+                log_unused=True,
+                budget=self._new_expansion_budget(),
+            )
+        else:
+            valid_lines = content_lines
 
         files_to_process = []
         for line in valid_lines:
             line = line.strip()
-            # We already filtered empty and # lines, but we re-strip for safety
-            if not line or line.startswith("#"):
+            # Filter empty lines, comments, and internal import boundary markers
+            if not line or line.startswith("#") or self._is_import_marker(line):
                 continue
-                
+
             is_random = line.startswith("random:")
-            path_str = line[len("random:"):].strip() if is_random else line
-            
+            path_str = (line[len("random:"):].strip() if is_random else line).replace("\\", "/")
+            if is_random and not path_str:
+                print("[Adaptive Prompts] Warning: Empty 'random:' directive. Skipping.")
+                continue
+
+            if not _is_safe_relative_ref(path_str):
+                print(f"[Adaptive Prompts] Security Warning: path '{path_str}' attempts path traversal. Skipping.")
+                continue
+
             resolved_path = os.path.normpath(os.path.join(resolved_base_dir, path_str))
             if not _is_safe_path(resolved_base_dir, resolved_path):
                 print(f"[Adaptive Prompts] Security Warning: path '{path_str}' attempts path traversal. Skipping.")
                 continue
-                
-            if is_random and os.path.isdir(resolved_path):
-                chosen_file = self._get_random_file(resolved_path, rng)
-                if chosen_file:
-                    files_to_process.append(chosen_file)
+
+            if is_random:
+                if os.path.isdir(resolved_path):
+                    chosen_file = self._get_random_file(resolved_path, rng)
+                    if chosen_file:
+                        files_to_process.append(chosen_file)
+                else:
+                    print(f"[Adaptive Prompts] Warning: Random path '{resolved_path}' is not a valid directory.")
             else:
                 if os.path.isfile(resolved_path):
                     files_to_process.append(resolved_path)
                 else:
                     print(f"[Adaptive Prompts] Warning: Path '{resolved_path}' is not a valid file.")
-                    
+
         return files_to_process
 
     def _resolve_switch_macros(self, text: str, context: dict) -> str:
@@ -468,41 +1158,41 @@ class PromptStackLoader:
             if start == -1:
                 out.append(text[idx:])
                 break
-                
+
             out.append(text[idx:start])
-            
+
             brace_count = 0
             end = -1
             for i in range(start, len(text)):
                 if text[i] == '{': brace_count += 1
-                elif text[i] == '}': 
+                elif text[i] == '}':
                     brace_count -= 1
                     if brace_count == 0:
                         end = i
                         break
-                        
+
             if end == -1:
                 out.append(text[start:start+11])
                 idx = start + 11
                 continue
-                
+
             block = text[start+1:end]
             choices = split_pipes(block)
             first_choice = choices[0].strip()
-            
+
             m = re.match(r"^ps_switch\s*\((.*?)\)$", first_choice, re.DOTALL)
             if not m:
                 out.append(text[start:end+1])
                 idx = end + 1
                 continue
-                
+
             var_name = m.group(1).strip()
             var_values = [str(v).strip() for v in context.get(var_name, {}).values()]
-            
+
             matched_res = ""
             default_res = ""
             has_default = False
-            
+
             accumulated_cases = []
             default_pending = False
 
@@ -527,18 +1217,18 @@ class PromptStackLoader:
                         if any(k in var_values for k in accumulated_cases):
                             matched_res = res_val
                             break
-                        
+
                         if default_pending:
                             default_res = res_val
                             has_default = True
                             default_pending = False
-                            
+
                         accumulated_cases = [] # Reset after a result block
-            
+
             final_res = matched_res if matched_res else (default_res if has_default else "")
             if "{ps_switch(" in final_res:
                 final_res = self._resolve_switch_macros(final_res, context)
-                
+
             out.append(final_res)
             idx = end + 1
 
@@ -550,9 +1240,9 @@ class PromptStackLoader:
             if os.path.getsize(filepath) > 5 * 1024 * 1024:
                 print(f"[Adaptive Prompts] Warning: File '{filepath}' exceeds 5MB limit. Skipping.")
                 return "", []
-            with open(filepath, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
                 content = f.read()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             print(f"[Adaptive Prompts] Warning: Failed to read file '{filepath}': {e}")
             return "", []
 
@@ -588,16 +1278,16 @@ class PromptStackLoader:
     def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None):
         _sync_base_config()
         rng = SeededRandom(seed)
-        
+
         resolved_base_dir = self._resolve_base_dir(base_dir)
-            
+
         raw_lines = self._resolve_paths(resolved_base_dir, stack_file, inline_stack)
         files_to_process = self._build_final_file_list(raw_lines, resolved_base_dir, rng)
 
         current_context = {}
         if context is not None:
             current_context = _normalize_input_context(context)
-        
+
         lora_tags = []
         accumulated_prompts = []
 
@@ -606,7 +1296,7 @@ class PromptStackLoader:
             if evaluated_text:
                 accumulated_prompts.append(evaluated_text)
             lora_tags.extend(file_loras)
-            
+
         # Ensure context buckets are normalized
         for k, v in list(current_context.items()):
             if isinstance(v, _OverrideBucket):
@@ -619,5 +1309,5 @@ class PromptStackLoader:
 
         lora_string = " ".join(lora_tags)
         final_prompt_string = ", ".join(accumulated_prompts)
-        
+
         return (final_prompt_string, current_context, lora_string)
