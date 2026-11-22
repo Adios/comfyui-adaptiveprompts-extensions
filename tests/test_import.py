@@ -242,19 +242,32 @@ def test_import_security_strictly_constrained_to_base_dir(tmp_path, monkeypatch,
         assert raw_abs == []
         assert "Security Warning: import '/etc/passwd' attempts path traversal" in capsys.readouterr().out
 
-    # 4. Traversal attempts disguised inside `replace:` combinations
-    evasion_stack = "\n".join([
-        "import:valid.stack.txt",
-        "replace:valid_leaf.txt|import:../project_b/outside.stack.txt",
-        "replace:import:valid.stack.txt|import:../project_b/outside.stack.txt",
-        "replace:import:valid.stack.txt|../project_b/outside_leaf.txt",
-        "replace:valid_leaf.txt|random:../project_b",
-    ])
-    raw_evasion = loader._resolve_paths(resolved_base, "", evasion_stack)
-    files_evasion = loader._build_final_file_list(raw_evasion, resolved_base, SeededRandom(0))
-    assert files_evasion == []
-    evasion_out = capsys.readouterr().out
-    assert "Security Warning:" in evasion_out
+    # 4. Traversal attempts disguised inside `replace:` combinations (tested independently
+    #    so earlier replacements cannot mask later ones)
+    evasion_cases = [
+        "import:valid.stack.txt\nreplace:valid_leaf.txt|import:../project_b/outside.stack.txt",
+        "import:valid.stack.txt\nreplace:import:valid.stack.txt|import:../project_b/outside.stack.txt",
+        "import:valid.stack.txt\nreplace:import:valid.stack.txt|../project_b/outside_leaf.txt",
+        "import:valid.stack.txt\nreplace:valid_leaf.txt|random:../project_b",
+    ]
+    for case in evasion_cases:
+        raw_evasion = loader._resolve_paths(resolved_base, "", case)
+        files_evasion = loader._build_final_file_list(raw_evasion, resolved_base, SeededRandom(0))
+        assert files_evasion == []
+        assert "Security Warning:" in capsys.readouterr().out
+
+    # 5. Absolute paths inside stack lines are blocked even when pointing inside base_dir
+    abs_inside_stack = str(project_a_dir / "valid.stack.txt")
+    abs_inside_leaf = str(project_a_dir / "valid_leaf.txt")
+    abs_inside_dir = str(project_a_dir)
+    raw_abs_inside = loader._resolve_paths(
+        resolved_base,
+        "",
+        f"import:{abs_inside_stack}\n{abs_inside_leaf}\nrandom:{abs_inside_dir}",
+    )
+    files_abs_inside = loader._build_final_file_list(raw_abs_inside, resolved_base, SeededRandom(0))
+    assert files_abs_inside == []
+    assert "Security Warning:" in capsys.readouterr().out
 
 
 def test_import_edge_cases_comments_missing_and_size_limit(tmp_path, monkeypatch, capsys):
@@ -820,3 +833,377 @@ def test_classical_cross_platform_security_hazards(tmp_path, monkeypatch):
     # Only `valid.txt` is allowed; the symlinked file in `random_pool` and all
     # device/ADS/drive/null-byte paths are blocked.
     assert [os.path.basename(f) for f in files] == ["valid.txt"]
+
+
+def test_security_marker_spoofing_and_modifier_injection_via_replace(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that internal boundary markers (`__ps_begin_import__:`, `__ps_end_import__:`),
+    nested modifier directives (`remove:`, `replace:`), and malformed modifiers cannot be
+    injected via `replace:` right-hand sides or raw stack lines.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    for name in ["a.txt", "b.txt", "c.txt", "legit_leaf.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+    (prompts_dir / "legit.stack.txt").write_text("legit_leaf.txt\n", encoding="utf-8")
+
+    # 1. Marker spoofing via `replace:` RHS must not swallow subsequent `b.txt`
+    spoof_stack = "\n".join([
+        "import:legit.stack.txt",
+        "a.txt",
+        "b.txt",
+        "replace:a.txt|__ps_begin_import__:import:legit.stack.txt",
+        "remove:import:legit.stack.txt",
+    ])
+    loader = PromptStackLoader()
+    raw1 = loader._resolve_paths(str(prompts_dir), "", spoof_stack)
+    files1 = loader._build_final_file_list(raw1, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files1] == ["a.txt", "b.txt"]
+    assert "Invalid modifier directive" in capsys.readouterr().out
+
+    # 2. Second-stage modifier injection (`replace:a.txt|remove:b.txt`) must not execute in `_build_final_file_list`
+    inject_stack = "\n".join([
+        "a.txt",
+        "b.txt",
+        "replace:a.txt|remove:b.txt",
+        "replace:a.txt|replace:b.txt|c.txt",
+        "replace:a.txt|#comment",
+        "remove:",
+        "replace:a.txt",
+        "replace:a.txt|",
+        "replace:|b.txt",
+    ])
+    raw2 = loader._resolve_paths(str(prompts_dir), "", inject_stack)
+    files2 = loader._build_final_file_list(raw2, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files2] == ["a.txt", "b.txt"]
+    out2 = capsys.readouterr().out
+    assert "Invalid modifier directive" in out2
+    assert "Security Warning:" not in out2
+
+    # 3. Cycle bypass attempt via `replace:a.txt|replace:b.txt|import:self_bypass.stack.txt`
+    (prompts_dir / "self_bypass.stack.txt").write_text(
+        "a.txt\n"
+        "replace:a.txt|replace:b.txt|import:self_bypass.stack.txt\n"
+        "b.txt\n",
+        encoding="utf-8",
+    )
+    raw3 = loader._resolve_paths(str(prompts_dir), "self_bypass.stack.txt", "")
+    files3 = loader._build_final_file_list(raw3, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files3] == ["a.txt", "b.txt"]
+
+
+def test_security_dag_import_bomb_and_replace_amplification_dos(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that non-cyclic exponential DAG import bombs ("Billion Laughs") and
+    repeated `replace:` amplification are stopped cleanly by total-import and
+    expanded-line budgets without hanging or exhausting memory.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    (prompts_dir / "leaf.txt").write_text("leaf", encoding="utf-8")
+
+    # 1. Binary DAG bomb of depth 20 (would expand 2^20 = 1,048,576 times without budget)
+    for i in range(20):
+        (prompts_dir / f"dag_{i}.stack.txt").write_text(
+            f"import:dag_{i + 1}.stack.txt\nimport:dag_{i + 1}.stack.txt\n",
+            encoding="utf-8",
+        )
+    (prompts_dir / "dag_20.stack.txt").write_text("leaf.txt\n", encoding="utf-8")
+
+    loader = PromptStackLoader()
+    raw_dag = loader._resolve_paths(str(prompts_dir), "dag_0.stack.txt", "")
+    files_dag = loader._build_final_file_list(raw_dag, str(prompts_dir), SeededRandom(0))
+    assert len(files_dag) <= PromptStackLoader.MAX_TOTAL_IMPORTS
+    assert "Maximum total import expansions" in capsys.readouterr().out
+
+    # 2. Repeated `replace:` line amplification bomb (50^6 = 15B lines without budget)
+    (prompts_dir / "dup50.stack.txt").write_text("leaf.txt\n" * 50, encoding="utf-8")
+    amp_stack = "leaf.txt\n" + ("replace:leaf.txt|import:dup50.stack.txt\n" * 6)
+    raw_amp = loader._resolve_paths(str(prompts_dir), "", amp_stack)
+    files_amp = loader._build_final_file_list(raw_amp, str(prompts_dir), SeededRandom(0))
+    assert len(files_amp) <= PromptStackLoader.MAX_EXPANDED_LINES
+    assert "Maximum expanded stack lines" in capsys.readouterr().out
+
+
+def test_security_windows_pre_realpath_unc_device_and_drive_relative(tmp_path, monkeypatch):
+    """
+    Verifies that `_is_safe_path`, `_resolve_base_dir`, and `stack_file` block UNC paths,
+    Windows device namespaces, drive-relative paths (`C:file.txt`), and extended reserved
+    device names (`CONIN$`, `CONOUT$`, `COM¹`, trailing space/dot variants) BEFORE calling
+    `os.path.realpath` (preventing SMB/NTLM leaks and device-open hangs on Windows).
+    """
+    from py.prompt_stack_loader import _is_safe_path, _is_safe_relative_ref
+
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    base_str = str(prompts_dir)
+
+    real_realpath = os.path.realpath
+    realpath_calls = []
+
+    def tracking_realpath(p, *args, **kwargs):
+        realpath_calls.append(p)
+        return real_realpath(p, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", tracking_realpath)
+
+    pre_realpath_blocked = [
+        "\\\\evil-server\\share\\secret.txt",
+        "//evil-server/share/secret.txt",
+        "/\\evil-server/share/secret.txt",
+        "\\/evil-server\\share\\secret.txt",
+        "\\\\.\\CON",
+        "\\\\.",
+        "\\\\?\\C:\\Windows\\win.ini",
+        "C:valid.txt",
+        "C:",
+        os.path.join(base_str, "CON.txt"),
+        os.path.join(base_str, "CON .txt"),
+        os.path.join(base_str, "CON."),
+        os.path.join(base_str, "CONIN$.txt"),
+        os.path.join(base_str, "CONOUT$.txt"),
+        os.path.join(base_str, "COM\u00b9.txt"),
+        os.path.join(base_str, "LPT\u00b3.txt"),
+        os.path.join(base_str, "valid.txt:$DATA"),
+    ]
+    for bad in pre_realpath_blocked:
+        realpath_calls.clear()
+        assert _is_safe_path(base_str, bad) is False, f"Expected blocked: {bad!r}"
+        assert realpath_calls == [], f"os.path.realpath must NOT be called before rejecting {bad!r}"
+
+    # Verify `_is_safe_relative_ref` blocks same-drive, absolute, UNC, ADS, and reserved paths
+    for bad_rel in [
+        "C:valid.txt",
+        "C:\\valid.txt",
+        "/etc/passwd",
+        "\\windows\\win.ini",
+        "//evil/share/x.txt",
+        "valid.txt:$DATA",
+        "valid.txt\x00.txt",
+        "sub/CONIN$.txt",
+        "sub/CON .txt",
+        "sub/COM\u00b2.txt",
+    ]:
+        assert _is_safe_relative_ref(bad_rel) is False, f"Expected invalid relative ref: {bad_rel!r}"
+
+    # `_resolve_base_dir` rejects UNC / device / drive-relative without touching realpath
+    for bad_base in ["\\\\evil\\share", "//evil/share", "\\\\.\\CON", "C:prompts"]:
+        realpath_calls.clear()
+        assert PromptStackLoader._resolve_base_dir(bad_base) == str(prompts_dir)
+        assert realpath_calls == []
+
+
+def test_security_hardlink_cycle_detection(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that circular imports formed via hard links (distinct paths sharing
+    an inode, where `os.path.realpath` returns different strings) are detected.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    (prompts_dir / "leaf.txt").write_text("leaf", encoding="utf-8")
+
+    orig = prompts_dir / "orig.stack.txt"
+    hardlink = prompts_dir / "hardlink.stack.txt"
+    orig.write_text("leaf.txt\nimport:hardlink.stack.txt\n", encoding="utf-8")
+    os.link(orig, hardlink)
+
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "orig.stack.txt", "")
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files] == ["leaf.txt"]
+    assert "Circular import detected" in capsys.readouterr().out
+
+
+def test_logic_inline_stack_scoping_and_current_dir_isolation(tmp_path, monkeypatch):
+    """
+    Verifies that when `stack_file` lives in a subdirectory:
+    1. `stack_file`'s `./` paths resolve relative to `stack_file`'s directory, while
+       `inline_stack`'s `./` and `random:.` paths resolve relative to `base_dir`.
+    2. `remove:`/`replace:` inside `stack_file` do NOT leak out to mutate lines added
+       in `inline_stack`.
+    3. `inline_stack` can still `remove:`/`replace:` lines and `import:` blocks from `stack_file`,
+       and can sequentially re-import `stack_file` without a false cycle error.
+    4. `IS_CHANGED` also anchors `inline_stack` relative to `base_dir`.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    sub_dir = prompts_dir / "projects" / "scene"
+    sub_dir.mkdir(parents=True)
+
+    (prompts_dir / "root_leaf.txt").write_text("root leaf", encoding="utf-8")
+    (sub_dir / "local_leaf.txt").write_text("local leaf", encoding="utf-8")
+    (sub_dir / "drop_me.txt").write_text("drop me", encoding="utf-8")
+    (sub_dir / "sub_inc.stack.txt").write_text("local_leaf.txt\n", encoding="utf-8")
+    (prompts_dir / "local_leaf.txt").write_text("base local leaf", encoding="utf-8")
+
+    (sub_dir / "01.stack.txt").write_text(
+        "import:./sub_inc.stack.txt\n"
+        "./local_leaf.txt\n"
+        "./drop_me.txt\n"
+        "remove:./drop_me.txt\n",
+        encoding="utf-8",
+    )
+
+    inline_stack = "\n".join([
+        "./root_leaf.txt",
+        "projects/scene/drop_me.txt",
+        "remove:import:projects/scene/sub_inc.stack.txt",
+    ])
+
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "projects/scene/01.stack.txt", inline_stack)
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+
+    assert files == [
+        str(sub_dir / "local_leaf.txt"),
+        str(prompts_dir / "root_leaf.txt"),
+        str(sub_dir / "drop_me.txt"),
+    ]
+
+    # Sequential reuse: `inline_stack` importing the same file as `stack_file` is not cyclic
+    (prompts_dir / "reusable.stack.txt").write_text("root_leaf.txt\n", encoding="utf-8")
+    raw_reuse = loader._resolve_paths(str(prompts_dir), "reusable.stack.txt", "import:reusable.stack.txt")
+    files_reuse = loader._build_final_file_list(raw_reuse, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files_reuse] == ["root_leaf.txt", "root_leaf.txt"]
+
+    # IS_CHANGED must detect edits to `./root_leaf.txt` referenced in `inline_stack`
+    h1 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "projects/scene/01.stack.txt", "./root_leaf.txt")
+    mtime = time.time() + 15.0
+    os.utime(prompts_dir / "root_leaf.txt", (mtime, mtime))
+    h2 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "projects/scene/01.stack.txt", "./root_leaf.txt")
+    assert h1 != h2
+
+
+def test_logic_direct_and_nested_import_modifiers_and_ordering(tmp_path, monkeypatch):
+    """
+    Verifies that:
+    1. `remove:import:shared` removes BOTH direct and nested occurrences of `import:shared`.
+    2. Modifier execution preserves exact written order across mixed `import:` and file swaps.
+    3. `replace:import:s2|import:s1_s2` (where `s1_s2` itself imports `s2`) replaces both
+       direct and nested `import:s2` exactly once without double-expanding.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    for name in ["s1.txt", "s2.txt", "c.txt", "a.txt", "b.txt", "x.txt", "y.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+
+    (prompts_dir / "shared.stack.txt").write_text("s2.txt\n", encoding="utf-8")
+    (prompts_dir / "child.stack.txt").write_text("import:shared.stack.txt\nc.txt\n", encoding="utf-8")
+    (prompts_dir / "s1_s2.stack.txt").write_text("s1.txt\nimport:shared.stack.txt\n", encoding="utf-8")
+    (prompts_dir / "a.stack.txt").write_text("a.txt\n", encoding="utf-8")
+    (prompts_dir / "b.stack.txt").write_text("b.txt\n", encoding="utf-8")
+
+    loader = PromptStackLoader()
+
+    # 1. Remove both direct and nested `import:shared.stack.txt`
+    stack1 = "import:shared.stack.txt\nimport:child.stack.txt\nremove:import:shared.stack.txt"
+    files1 = loader._build_final_file_list(
+        loader._resolve_paths(str(prompts_dir), "", stack1), str(prompts_dir), SeededRandom(0)
+    )
+    assert [os.path.basename(f) for f in files1] == ["c.txt"]
+
+    # 2. Exact modifier ordering: `import:a -> x`, `x -> import:b`, `import:b -> y`
+    stack2 = "\n".join([
+        "import:a.stack.txt",
+        "import:b.stack.txt",
+        "replace:import:a.stack.txt|x.txt",
+        "replace:x.txt|import:b.stack.txt",
+        "replace:import:b.stack.txt|y.txt",
+    ])
+    files2 = loader._build_final_file_list(
+        loader._resolve_paths(str(prompts_dir), "", stack2), str(prompts_dir), SeededRandom(0)
+    )
+    assert [os.path.basename(f) for f in files2] == ["y.txt", "y.txt"]
+
+    # 3. Self-wrapping import replacement (`shared -> s1_s2` where `s1_s2` imports `shared`)
+    #    must expand both direct and nested `shared` exactly once (no double expansion).
+    stack3 = "\n".join([
+        "import:shared.stack.txt",
+        "import:child.stack.txt",
+        "replace:import:shared.stack.txt|import:s1_s2.stack.txt",
+    ])
+    files3 = loader._build_final_file_list(
+        loader._resolve_paths(str(prompts_dir), "", stack3), str(prompts_dir), SeededRandom(0)
+    )
+    assert [os.path.basename(f) for f in files3] == ["s1.txt", "s2.txt", "s1.txt", "s2.txt", "c.txt"]
+
+
+def test_logic_lazy_replace_import_evaluation(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that `replace:unmatched|import:<other>` does NOT open or warn about `<other>`
+    and does NOT pollute `IS_CHANGED` when the target never matches.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    (prompts_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    unused_stack = prompts_dir / "unused.stack.txt"
+    unused_stack.write_text("keep.txt\n", encoding="utf-8")
+
+    inline = "\n".join([
+        "keep.txt",
+        "replace:nonexistent.txt|import:missing_never_opened.stack.txt",
+        "replace:nonexistent.txt|import:unused.stack.txt",
+    ])
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "", inline)
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+    assert [os.path.basename(f) for f in files] == ["keep.txt"]
+    out = capsys.readouterr().out
+    assert "is not a valid file" not in out
+
+    # Modifying `unused.stack.txt` must not invalidate `IS_CHANGED` since it was never matched
+    h1 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "", inline)
+    mtime = time.time() + 25.0
+    os.utime(unused_stack, (mtime, mtime))
+    h2 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "", inline)
+    assert h1 == h2
+
+
+def test_logic_utf8_bom_corrupt_encoding_and_random_edge_cases(tmp_path, monkeypatch, capsys):
+    """
+    Verifies:
+    1. Stack files and prompt files saved with UTF-8 BOM (`\\ufeff`) parse directives cleanly.
+    2. Non-UTF-8 binary stack files are skipped gracefully without raising UnicodeDecodeError.
+    3. Empty `random:` warns and skips cleanly.
+    4. `_get_random_file` and `IS_CHANGED` ignore broken symlinks, directory symlinks named
+       `*.txt`, and symlinks escaping the target `random:` folder into sibling folders.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+    (prompts_dir / "ok.txt").write_bytes("\ufeffhello world".encode("utf-8"))
+    (prompts_dir / "drop.txt").write_text("drop", encoding="utf-8")
+    (prompts_dir / "bom_child.stack.txt").write_bytes("\ufeffok.txt\ndrop.txt\n".encode("utf-8"))
+    (prompts_dir / "bom_root.stack.txt").write_bytes(
+        "\ufeffimport:bom_child.stack.txt\nremove:drop.txt\n".encode("utf-8")
+    )
+    (prompts_dir / "corrupt.stack.txt").write_bytes(b"\xff\xfe\x80\x81invalid")
+
+    loader = PromptStackLoader()
+    prompt, _, _ = loader.process(
+        seed=0,
+        base_dir=str(prompts_dir),
+        stack_file="bom_root.stack.txt",
+        inline_stack="import:corrupt.stack.txt\nrandom:",
+    )
+    assert prompt == "hello world"
+    out = capsys.readouterr().out
+    assert "Could not read imported stack file" in out
+    assert "Empty 'random:' directive" in out
+
+    # `random:` directory with broken symlink, directory symlink named `*.txt`, and sibling symlink
+    pool = prompts_dir / "pool"
+    sibling = prompts_dir / "sibling"
+    pool.mkdir()
+    sibling.mkdir()
+    (pool / "real.txt").write_text("real", encoding="utf-8")
+    sibling_target = sibling / "sibling_file.txt"
+    sibling_target.write_text("sibling", encoding="utf-8")
+
+    os.symlink(pool / "does_not_exist.txt", pool / "broken.txt")
+    os.symlink(sibling, pool / "dir_symlink.txt")
+    os.symlink(sibling_target, pool / "escaped_sibling.txt")
+
+    rng = SeededRandom(0)
+    for _ in range(20):
+        chosen = loader._get_random_file(str(pool), rng)
+        assert os.path.basename(chosen) == "real.txt"
+
+    # Modifying `sibling_target` must not change `IS_CHANGED` for `random:pool`
+    h1 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "", "random:pool")
+    mtime = time.time() + 30.0
+    os.utime(sibling_target, (mtime, mtime))
+    h2 = PromptStackLoader.IS_CHANGED(str(prompts_dir), "", "random:pool")
+    assert h1 == h2
