@@ -545,3 +545,43 @@ def test_heterogeneous_injection_and_template_hardening(tmp_path, monkeypatch, c
     )
     assert (time.time() - start) < 2.0
     assert [os.path.basename(f) for f in files_redos] == ["a.txt"]
+
+
+def test_set_with_successive_imports_and_replace_import_snapshot(tmp_path, monkeypatch):
+    """
+    Verifies:
+    1. A single `set:var=a` affects all successive `import:` files below it in the same scope.
+    2. `replace:import:old|import:new` passes the exact `set:` variable snapshot active at
+       the `replace:` line into `new` (unaffected by later `set:` lines below the `replace:`).
+    3. Literal `$$` in a `replace:...|import:` target filename is not double-substituted.
+    """
+    prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
+
+    for name in ["a_1.txt", "a_2.txt", "b_1.txt", "old_leaf.txt", "new_a.txt", "new_b.txt"]:
+        (prompts_dir / name).write_text(name, encoding="utf-8")
+
+    (prompts_dir / "imp1.stack.txt").write_text("${var}_1.txt\n", encoding="utf-8")
+    (prompts_dir / "imp2.stack.txt").write_text("${var}_2.txt\n", encoding="utf-8")
+    (prompts_dir / "old.stack.txt").write_text("old_leaf.txt\n", encoding="utf-8")
+    (prompts_dir / "new_$5.stack.txt").write_text("new_${var}.txt\n", encoding="utf-8")
+
+    inline_stack = "\n".join([
+        "set:var=a",
+        "import:imp1.stack.txt",
+        "import:imp2.stack.txt",
+        "import:old.stack.txt",
+        "replace:import:old.stack.txt|import:new_$$5.stack.txt",
+        "set:var=b",
+        "import:imp1.stack.txt",
+    ])
+
+    loader = PromptStackLoader()
+    raw = loader._resolve_paths(str(prompts_dir), "", inline_stack)
+    files = loader._build_final_file_list(raw, str(prompts_dir), SeededRandom(0))
+
+    assert [os.path.basename(f) for f in files] == [
+        "a_1.txt",  # imp1 sees var=a
+        "a_2.txt",  # successive imp2 also sees var=a
+        "new_a.txt", # replace:import:old|import:new_$$5 uses snapshot var=a (not later var=b) and no double-sub
+        "b_1.txt",  # imp1 after set:var=b sees var=b
+    ]

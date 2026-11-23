@@ -763,6 +763,7 @@ class PromptStackLoader:
                         budget=budget,
                         template_vars=mod_vars,
                         source_label=new_path,
+                        substitute_self=False,
                     )
                 else:
                     replacement_payload = [new_path]
@@ -853,6 +854,7 @@ class PromptStackLoader:
         budget: dict = None,
         template_vars: Optional[dict] = None,
         source_label: str = "stack",
+        substitute_self: bool = True,
     ) -> List[str]:
         """
         Recursively expands `import:<relative_path>` directives in-place with shell-style
@@ -964,10 +966,13 @@ class PromptStackLoader:
                         print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
                 continue
 
-            substituted = cls._substitute_template_line(clean_line, local_vars, source_label, log_warnings=log_unused)
-            if substituted is None:
-                continue
-            substituted = substituted.strip()
+            if substitute_self:
+                substituted = cls._substitute_template_line(clean_line, local_vars, source_label, log_warnings=log_unused)
+                if substituted is None:
+                    continue
+                substituted = substituted.strip()
+            else:
+                substituted = clean_line
             if not substituted or substituted.startswith("#") or cls._is_import_marker(substituted):
                 continue
             if cls._is_set_line(substituted) or cls._is_modifier_line(substituted):
