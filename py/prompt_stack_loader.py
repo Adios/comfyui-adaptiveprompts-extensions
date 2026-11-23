@@ -325,10 +325,6 @@ class PromptStackLoader:
                 "context": ("DICT", {
                     "tooltip": "Optional upstream context to build upon."
                 }),
-                "debug_log": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "When enabled, prints the final resolved stack file list to the console for debugging."
-                }),
             },
         }
 
@@ -372,6 +368,15 @@ class PromptStackLoader:
     MAX_TEMPLATE_VARS = 128
     MAX_VAR_VALUE_LEN = 1024
     MAX_LINE_LEN = 2048
+    _debug_log: bool = False
+
+    @classmethod
+    def get_debug_log(cls) -> bool:
+        return bool(cls._debug_log)
+
+    @classmethod
+    def set_debug_log(cls, enabled: bool) -> None:
+        cls._debug_log = bool(enabled)
     _VAR_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
     # Single-pass O(N) template tokenizer (disjoint branches, no nested quantifiers -> ReDoS-safe).
     # Supports: `$$` (literal `$`), `$name`, `${name}`, and Bash-style `${name:-default}`.
@@ -1159,7 +1164,7 @@ class PromptStackLoader:
         return stack_expanded
 
     @classmethod
-    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None, debug_log=False):
+    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
         import hashlib
         m = hashlib.sha256()
 
@@ -1490,7 +1495,7 @@ class PromptStackLoader:
 
         return evaluated_text.strip(), found_loras
 
-    def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None, debug_log: bool = False):
+    def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None):
         _sync_base_config()
         rng = SeededRandom(seed)
 
@@ -1499,7 +1504,7 @@ class PromptStackLoader:
         raw_lines = self._resolve_paths(resolved_base_dir, stack_file, inline_stack)
         files_to_process = self._build_final_file_list(raw_lines, resolved_base_dir, rng)
 
-        if debug_log:
+        if self._debug_log:
             print(f"[Adaptive Prompts] Resolved stack ({len(files_to_process)} files, base_dir='{resolved_base_dir}'):")
             for idx, fpath in enumerate(files_to_process, start=1):
                 try:

@@ -366,8 +366,10 @@ def test_set_is_changed_cache_invalidation(tmp_path, monkeypatch):
 
 def test_debug_log_prints_resolved_stack(tmp_path, monkeypatch, capsys):
     """
-    Verifies the optional `debug_log` toggle prints the final resolved stack list
-    when enabled and stays silent when disabled (default).
+    Verifies the ComfyUI Settings-backed `PromptStackLoader._debug_log` toggle:
+    1. Does NOT add a widget to `PromptStackLoader.INPUT_TYPES` (preserves existing node UI).
+    2. Defaults to False (silent) and prints the numbered resolved stack when enabled.
+    3. Does NOT alter `IS_CHANGED` (toggling debug logging never forces downstream re-runs).
     """
     prompts_dir = _setup_mock_root(tmp_path, monkeypatch)
 
@@ -375,15 +377,26 @@ def test_debug_log_prints_resolved_stack(tmp_path, monkeypatch, capsys):
     (prompts_dir / "two.txt").write_text("two", encoding="utf-8")
     (prompts_dir / "proto.stack.txt").write_text("one.txt\n${second}\n", encoding="utf-8")
 
+    input_types = PromptStackLoader.INPUT_TYPES()
+    assert "debug_log" not in input_types.get("required", {})
+    assert "debug_log" not in input_types.get("optional", {})
+
     inline = "set:second=two.txt\nimport:proto.stack.txt"
     loader = PromptStackLoader()
 
-    # Default (debug_log=False): no resolved stack dump
+    # Default (_debug_log=False): no resolved stack dump
+    monkeypatch.setattr(PromptStackLoader, "_debug_log", False)
+    h_off = PromptStackLoader.IS_CHANGED(base_dir=str(prompts_dir), stack_file="", inline_stack=inline)
     loader.process(seed=0, base_dir=str(prompts_dir), stack_file="", inline_stack=inline)
     assert "Resolved stack" not in capsys.readouterr().out
 
-    # Enabled (debug_log=True): prints numbered base_dir-relative resolved paths
-    loader.process(seed=0, base_dir=str(prompts_dir), stack_file="", inline_stack=inline, debug_log=True)
+    # Enabled via settings helper: prints numbered base_dir-relative resolved paths, same IS_CHANGED hash
+    PromptStackLoader.set_debug_log(True)
+    assert PromptStackLoader.get_debug_log() is True
+    h_on = PromptStackLoader.IS_CHANGED(base_dir=str(prompts_dir), stack_file="", inline_stack=inline)
+    assert h_off == h_on
+
+    loader.process(seed=0, base_dir=str(prompts_dir), stack_file="", inline_stack=inline)
     out = capsys.readouterr().out
     assert "Resolved stack (2 files" in out
     assert "01. one.txt" in out

@@ -59,7 +59,6 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
 - **`stack_file`**: The path to a `.txt` file containing your execution stack (e.g., `stacks/illustrious.txt`). *(Note: Unlike the paths inside the stack, this top-level parameter is allowed to use `../` to escape your `base_dir`, as long as it remains inside the extension folder).*
 - **`inline_stack`**: A multiline text field used to define paths, import snippets, or apply on-the-fly overrides directly within the node.
 - **`override_context`**: Determines how incoming context is handled: **Merge** (appends new variables) or **Override** (replaces existing variables).
-- **`debug_log`** *(optional)*: When enabled, prints the final resolved, numbered list of files to the console—useful for inspecting deeply nested `import:`, `set:`, and `replace:` stacks.
 
 > **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths (absolute paths like `/etc/passwd` or `C:\...` are blocked). Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed:
 > - **Base-Directory Relative (default):** Paths without a leading `./` or `../` (e.g., `modules/lighting/sunny.txt` or `import:stacks/presets/day.txt`) always resolve from your defined `base_dir`.
@@ -171,7 +170,7 @@ import:stacks/presets/_portrait_proto.stack.txt
 
 *(If `lighting` or `outfit` is omitted by the caller, `${lighting:-sunny}` and `${outfit:-casual}` automatically fall back to `sunny` and `casual`, while `${optional_finish:-}` cleanly omits the line.)*
 
-If you need to inspect the exact final file order produced by nested `import:`, `set:`, and `replace:` directives, toggle **`debug_log`** on the node to print the numbered resolved stack to the console.
+If you need to inspect the exact final file order produced by nested `import:`, `set:`, and `replace:` directives, enable **Settings → Adaptive Prompts Extensions → Debugging → Log Resolved Stack** in ComfyUI to print the numbered resolved stack to the console on the next node execution (toggling this setting does not change the node UI or invalidate downstream caches).
 
 ### 🧱 Modular Stack Composition: Combining `import:` with `replace:` & `remove:`
 

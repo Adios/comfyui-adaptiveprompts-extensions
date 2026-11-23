@@ -18,6 +18,42 @@ except ImportError:
     _spec.loader.exec_module(_loader_module)
     PromptStackLoader = _loader_module.PromptStackLoader
 
+# Register extension-specific settings routes when running inside ComfyUI.
+# Guarded with try/except so standalone unit tests without ComfyUI's `server` still load cleanly.
+try:
+    from aiohttp import web
+    from server import PromptServer
+
+    if PromptServer.instance is not None:
+        @PromptServer.instance.routes.get("/adaptive_prompts_extensions/config")
+        async def get_ext_config_route(request):
+            return web.json_response({"debug_log": PromptStackLoader.get_debug_log()})
+
+        @PromptServer.instance.routes.post("/adaptive_prompts_extensions/config")
+        async def set_ext_config_route(request):
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+
+            if not isinstance(data, dict):
+                return web.json_response({"status": "error", "message": "JSON object expected"}, status=400)
+
+            if "debug_log" in data:
+                val = data["debug_log"]
+                if not isinstance(val, bool):
+                    return web.json_response({"status": "error", "message": "'debug_log' must be a boolean"}, status=400)
+                PromptStackLoader.set_debug_log(val)
+
+            return web.json_response({
+                "status": "success",
+                "debug_log": PromptStackLoader.get_debug_log(),
+            })
+except ImportError:
+    pass
+
+WEB_DIRECTORY = "./web"
+
 NODE_CLASS_MAPPINGS = {
     "PromptStackLoader": PromptStackLoader,
 }
@@ -26,4 +62,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptStackLoader": "🥞 Prompt Stack Loader 🥞",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
