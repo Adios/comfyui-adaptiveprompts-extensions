@@ -38,7 +38,7 @@ By leveraging this node, you can transition your workflow into a highly adaptabl
 
 #### Key Features
 *   **Sequential File Processing:** Load and evaluate a list of text files (a "stack") in order. File paths can be relative or specifically pull a random file from a directory.
-*   **Modular Stack Composition (`import:`):** Break monolithic stacks into reusable building blocks (headers, footers, subject setups) and import them on demand—eliminating multi-node loader chains and copy-paste drift.
+*   **Modular Stack Composition (`import:`, `set:`):** Break monolithic stacks into reusable prototypes and building blocks, parameterize them with `set:name=value` and `${name}` placeholders, and import them on demand—eliminating multi-node loader chains and copy-paste drift.
 *   **Dynamic Stack Modifiers (`replace:`, `remove:`):** Surgically swap or exclude specific lines in-place across your stack (including lines pulled in via `import:`) without editing the underlying files.
 *   **Hidden Files & Local Overrides:** Any file or directory starting with `_` or `.` is completely hidden from the randomizer. This allows you to safely store specialized states or drafts (e.g., `_explicit_override.txt`) alongside your main prompts, loading them only when you explicitly ask for them!
 *   **Automatic LoRA Tag Extraction:** Any `<lora:name:weight>` tags found within your stacked files are automatically extracted and compiled into a clean `lora_string` output to be sent directly to a LoRA Tag Loader.
@@ -59,6 +59,7 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
 - **`stack_file`**: The path to a `.txt` file containing your execution stack (e.g., `stacks/illustrious.txt`). *(Note: Unlike the paths inside the stack, this top-level parameter is allowed to use `../` to escape your `base_dir`, as long as it remains inside the extension folder).*
 - **`inline_stack`**: A multiline text field used to define paths, import snippets, or apply on-the-fly overrides directly within the node.
 - **`override_context`**: Determines how incoming context is handled: **Merge** (appends new variables) or **Override** (replaces existing variables).
+- **`debug_log`** *(optional)*: When enabled, prints the final resolved, numbered list of files to the console—useful for inspecting deeply nested `import:`, `set:`, and `replace:` stacks.
 
 > **Note on Paths & Security:** All file paths specified within a `stack_file` or the `inline_stack` must be relative paths (absolute paths like `/etc/passwd` or `C:\...` are blocked). Path resolution is **cross-platform safe** (works across Windows/macOS/Linux) and strictly sandboxed:
 > - **Base-Directory Relative (default):** Paths without a leading `./` or `../` (e.g., `modules/lighting/sunny.txt` or `import:stacks/presets/day.txt`) always resolve from your defined `base_dir`.
@@ -71,8 +72,12 @@ A ready-to-use example workflow is also available: **[Prompt Stack Loader Three 
 
 Each line in a `stack_file` or `inline_stack` acts as an instruction. Commands are processed in a two-stage pipeline: **Stage 1** recursively expands all `import:` directives in-place, and **Stage 2** applies `remove:` and `replace:` modifiers before resolving `random:` directories.
 
-##### 1. Composition & Selection Commands
+##### 1. Composition, Template Variables & Selection Commands
 
+- **`set:<name>=<value>`, `${name}`, & `${name:-default}`** — Defines a stack template variable with Bash-style default fallback (`${name}` / `$name` for required slots, `${name:-default}` when unset or empty, and `$$` for a literal `$`).
+  - **Shell-Style Scoping:** A `set:` applies to all lines and `import:` calls **below it** in the same file. Nested imports inherit active variables and may override them for their own subtree, but child `set:` directives **never leak upward** to the parent or sideways into sibling imports.
+  - **Single-Pass, Safe & Loud:** Substitution runs via a pure linear-time dictionary lookup (no `str.format`, no `eval`, no recursion, and defaults are literal strings) on stack lines only—prompt `.txt` file bodies are untouched. Command structures (`set:`, `remove:`, `replace:<old>|<new>`) are parsed before variable substitution so values cannot inject `|` delimiters or hijack plain lines into `set:`/`remove:`/`replace:` commands, and all resolved paths still pass through the exact same sandbox security gate. Undefined required placeholders log a clear warning naming the variable and source file and skip the line.
+  - **Values Can Be Paths or Commands:** A variable can hold a path segment (e.g., `set:subject=frieren`) or a path-producing command (e.g., `set:action=random:actions/leisure`), and optional slots can use an empty default (`${optional_extra:-}`) to cleanly omit the line when unset.
 - **`import:<stack_path>`** — Recursively includes another stack file in-place at the exact position of the `import:` line.
   - **Strict `base_dir` Sandbox:** Unlike the node's top-level `stack_file` input, `import:` is strictly constrained to the node's resolved `base_dir`. For example, if `base_dir` is set to `prompt_examples/arch/illustrious`, `import:` can only load files inside `prompt_examples/arch/illustrious` (escaping via `../`, absolute paths, or symlinks pointing outside `base_dir` are blocked, and files >5MB are skipped).
   - **Cycle & Depth Protection:** The loader tracks the active import chain (`A -> B -> A`) and enforces a maximum nesting depth of 32. Circular imports (direct self-imports, mutual cycles, or symlink loops) are automatically skipped with a console warning, while importing the same snippet twice sequentially in the same stack is allowed and evaluated in order.
@@ -140,6 +145,33 @@ Later in the same stack (or in a separate downstream Stack Loader), you load an 
 ---
 
 ## 💡 Pro Tips & Advanced Workflows
+
+### 🧩 Parameterized Prototype Stacks (`set:` + `${var}` + `import:`)
+
+When dozens of scene stacks share the exact same structure and only swap a few slots (subject, lighting, action, or spatial layout), you can define a reusable prototype stack with `${var}` placeholders instead of repeating `PLACEHOLDER` + `replace:` boilerplate:
+
+**Example: Prototype Stack (`stacks/presets/_portrait_proto.stack.txt`)**
+```text
+anime/${character}/identity.txt
+anime/${character}/outfits/${outfit:-casual}.txt
+${action}
+lighting/${lighting:-sunny}.txt
+${optional_finish:-}
+finishes/cinematic.txt
+```
+
+**Example: Scene Instance (`scenes/frieren_cafe.stack.txt`)**
+```text
+set:character=frieren
+set:outfit=winter_coat
+set:action=random:actions/leisure
+set:lighting=rainy
+import:stacks/presets/_portrait_proto.stack.txt
+```
+
+*(If `lighting` or `outfit` is omitted by the caller, `${lighting:-sunny}` and `${outfit:-casual}` automatically fall back to `sunny` and `casual`, while `${optional_finish:-}` cleanly omits the line.)*
+
+If you need to inspect the exact final file order produced by nested `import:`, `set:`, and `replace:` directives, toggle **`debug_log`** on the node to print the numbered resolved stack to the console.
 
 ### 🧱 Modular Stack Composition: Combining `import:` with `replace:` & `remove:`
 

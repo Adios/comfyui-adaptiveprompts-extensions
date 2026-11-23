@@ -1,7 +1,7 @@
 import os
 import re
 import glob
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from collections import UserDict
 import sys
 import importlib
@@ -306,7 +306,7 @@ class PromptStackLoader:
                 "inline_stack": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "tooltip": "List of text paths to load sequentially (relative resolve against base_dir).\n- Use 'import:path' to include another stack file.\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
+                    "tooltip": "List of text paths to load sequentially (relative resolve against base_dir).\n- Use 'set:name=value' and '${name}' for template placeholders.\n- Use 'import:path' to include another stack file.\n- Use 'random:folder' to pick a random file.\n- Prefix with 'remove:' to exclude a path.\n- Use 'replace:old|new' to swap a path in-place.\n- Lines starting with # are ignored."
                 }),
                 "override_context": ("BOOLEAN", {
                     "default": False,
@@ -324,6 +324,10 @@ class PromptStackLoader:
             "optional": {
                 "context": ("DICT", {
                     "tooltip": "Optional upstream context to build upon."
+                }),
+                "debug_log": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When enabled, prints the final resolved stack file list to the console for debugging."
                 }),
             },
         }
@@ -365,6 +369,20 @@ class PromptStackLoader:
     # number of applied modifiers must be bounded to keep the cost O(MAX_TOTAL_MODIFIERS * N)
     # instead of letting a huge `inline_stack` / stack file stall the server (CPU DoS).
     MAX_TOTAL_MODIFIERS = 256
+    MAX_TEMPLATE_VARS = 128
+    MAX_VAR_VALUE_LEN = 1024
+    MAX_LINE_LEN = 2048
+    _VAR_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    # Single-pass O(N) template tokenizer (disjoint branches, no nested quantifiers -> ReDoS-safe).
+    # Supports: `$$` (literal `$`), `$name`, `${name}`, and Bash-style `${name:-default}`.
+    _TEMPLATE_TOKEN_RE = re.compile(
+        r"\$(?:"
+        r"(?P<escaped>\$)"
+        r"|(?P<named>[a-zA-Z_][a-zA-Z0-9_]*)"
+        r"|\{(?P<braced>[a-zA-Z_][a-zA-Z0-9_]*)(?::-(?P<default>[^}]*))?\}"
+        r"|(?P<invalid>)"
+        r")"
+    )
     _IMPORT_BEGIN_PREFIX = "__ps_begin_import__:"
     _IMPORT_END_PREFIX = "__ps_end_import__:"
 
@@ -477,8 +495,149 @@ class PromptStackLoader:
         return os.path.normpath(p.replace("\\", "/")).replace("\\", "/")
 
     @classmethod
+    def _is_set_line(cls, clean_line: str) -> bool:
+        return clean_line.startswith("set:")
+
+    @classmethod
+    def _parse_set_directive(cls, clean_line: str) -> Optional[Tuple[str, str]]:
+        """
+        Parses a `set:<name>=<value>` line into `(name, raw_value)`, or returns None
+        if the directive is malformed or the variable name is not a valid identifier.
+        """
+        if not clean_line.startswith("set:"):
+            return None
+        parts = clean_line[len("set:"):].split("=", 1)
+        if len(parts) != 2:
+            return None
+        name = parts[0].strip()
+        raw_value = parts[1].strip()
+        if not name or not cls._VAR_NAME_RE.match(name):
+            return None
+        return (name, raw_value)
+
+    @classmethod
+    def _substitute_template_line(
+        cls,
+        text: str,
+        template_vars: dict,
+        source_label: str,
+        log_warnings: bool = True,
+    ) -> Optional[str]:
+        """
+        Performs a single non-recursive O(N) template substitution against `template_vars`:
+        - `$var` and `${var}`: required variable (warns and skips line if undefined).
+        - `${var:-default}`: optional variable with Bash-style default fallback used when
+          `var` is unset or empty (`""`). `default` is treated as a literal string (never
+          recursively expanded).
+        - `$$`: literal `$`.
+
+        Security:
+        - Pure dictionary lookup (no `str.format`, no attribute/index lookup, no `eval`).
+        - Strictly single-pass (substituted values and defaults are never re-parsed).
+        - Disjoint linear-time regex (immune to ReDoS).
+        - Rejects control characters (`\\n`, `\\r`, `\\x00`) and enforces `MAX_LINE_LEN`.
+        """
+        if len(text) > cls.MAX_LINE_LEN:
+            if log_warnings:
+                print(f"[Adaptive Prompts] Warning: Stack line exceeds {cls.MAX_LINE_LEN} character limit in '{source_label}'. Skipping.")
+            return None
+
+        if "$" not in text:
+            return text
+
+        out_parts = []
+        total_len = 0
+        pos = 0
+        for m in cls._TEMPLATE_TOKEN_RE.finditer(text):
+            literal_chunk = text[pos:m.start()]
+            if literal_chunk:
+                total_len += len(literal_chunk)
+                if total_len > cls.MAX_LINE_LEN:
+                    if log_warnings:
+                        print(f"[Adaptive Prompts] Warning: Substituted line exceeds {cls.MAX_LINE_LEN} character limit in '{source_label}'. Skipping.")
+                    return None
+                out_parts.append(literal_chunk)
+
+            if m.group("escaped") is not None:
+                replacement = "$"
+            elif m.group("named") is not None:
+                var_name = m.group("named")
+                if var_name not in template_vars:
+                    if log_warnings:
+                        print(f"[Adaptive Prompts] Warning: Undefined stack variable '${var_name}' in '{source_label}' (line: '{text}'). Skipping.")
+                    return None
+                replacement = template_vars[var_name]
+            elif m.group("braced") is not None:
+                var_name = m.group("braced")
+                default_val = m.group("default")
+                val = template_vars.get(var_name)
+                if val is not None and val != "":
+                    replacement = val
+                elif default_val is not None:
+                    replacement = default_val
+                else:
+                    if log_warnings:
+                        print(f"[Adaptive Prompts] Warning: Undefined stack variable '${var_name}' in '{source_label}' (line: '{text}'). Skipping.")
+                    return None
+            else:
+                if log_warnings:
+                    print(f"[Adaptive Prompts] Warning: Invalid template syntax in '{source_label}' (line: '{text}'): invalid placeholder at position {m.start()}. Use '$$' for a literal '$'. Skipping.")
+                return None
+
+            total_len += len(replacement)
+            if total_len > cls.MAX_LINE_LEN:
+                if log_warnings:
+                    print(f"[Adaptive Prompts] Warning: Substituted line exceeds {cls.MAX_LINE_LEN} character limit in '{source_label}'. Skipping.")
+                return None
+            out_parts.append(replacement)
+            pos = m.end()
+
+        tail = text[pos:]
+        if tail:
+            total_len += len(tail)
+            if total_len > cls.MAX_LINE_LEN:
+                if log_warnings:
+                    print(f"[Adaptive Prompts] Warning: Substituted line exceeds {cls.MAX_LINE_LEN} character limit in '{source_label}'. Skipping.")
+                return None
+            out_parts.append(tail)
+
+        substituted = "".join(out_parts)
+        if "\n" in substituted or "\r" in substituted or "\x00" in substituted:
+            if log_warnings:
+                print(f"[Adaptive Prompts] Warning: Substituted line contains control characters in '{source_label}'. Skipping.")
+            return None
+        return substituted
+
+    @classmethod
     def _is_modifier_line(cls, clean_line: str) -> bool:
         return clean_line.startswith("remove:") or clean_line.startswith("replace:")
+
+    @classmethod
+    def _is_valid_modifier_operand(cls, operand: str) -> bool:
+        return bool(
+            operand
+            and not operand.startswith("#")
+            and not cls._is_import_marker(operand)
+            and not cls._is_modifier_line(operand)
+            and not cls._is_set_line(operand)
+        )
+
+    @classmethod
+    def _parse_modifier_parts(cls, mod_type: str, old_path: str, new_path: Optional[str] = None):
+        """
+        Validates already-split modifier operands into `(mod_type, normalized_target_key, new_path)`.
+        Splitting before template substitution prevents delimiter (`|`) injection from variable values.
+        """
+        old_clean = old_path.strip()
+        if mod_type == "remove":
+            if not cls._is_valid_modifier_operand(old_clean):
+                return None
+            return ("remove", cls._normalize_match(old_clean), None)
+        if mod_type == "replace" and new_path is not None:
+            new_clean = new_path.strip()
+            if cls._is_valid_modifier_operand(old_clean) and cls._is_valid_modifier_operand(new_clean):
+                return ("replace", cls._normalize_match(old_clean), new_clean)
+        return None
 
     @classmethod
     def _parse_modifier(cls, clean_line: str):
@@ -488,35 +647,15 @@ class PromptStackLoader:
         if the line is not a valid modifier command.
 
         Security: Rejects internal import boundary markers, nested modifier prefixes
-        (`remove:`, `replace:`), and comments as targets or replacement payloads to
-        prevent marker spoofing and second-stage modifier injection.
+        (`remove:`, `replace:`, `set:`), and comments as targets or replacement payloads
+        to prevent marker spoofing and second-stage directive injection.
         """
         if clean_line.startswith("remove:"):
-            path_to_exclude = clean_line[len("remove:"):].strip()
-            if (
-                not path_to_exclude
-                or path_to_exclude.startswith("#")
-                or cls._is_import_marker(path_to_exclude)
-                or cls._is_modifier_line(path_to_exclude)
-            ):
-                return None
-            return ("remove", cls._normalize_match(path_to_exclude), None)
+            return cls._parse_modifier_parts("remove", clean_line[len("remove:"):])
         if clean_line.startswith("replace:"):
             parts = clean_line[len("replace:"):].split("|", 1)
             if len(parts) == 2:
-                old_path = parts[0].strip()
-                new_path = parts[1].strip()
-                if (
-                    old_path
-                    and new_path
-                    and not old_path.startswith("#")
-                    and not new_path.startswith("#")
-                    and not cls._is_import_marker(old_path)
-                    and not cls._is_import_marker(new_path)
-                    and not cls._is_modifier_line(old_path)
-                    and not cls._is_modifier_line(new_path)
-                ):
-                    return ("replace", cls._normalize_match(old_path), new_path)
+                return cls._parse_modifier_parts("replace", parts[0], parts[1])
             return None
         return None
 
@@ -535,6 +674,7 @@ class PromptStackLoader:
         expand_replacement_imports: bool = True,
         log_unused: bool = True,
         budget: dict = None,
+        modifier_vars_list: Optional[List[dict]] = None,
     ) -> List[str]:
         """
         Applies `remove:` and `replace:` modifiers sequentially to `lines`.
@@ -578,7 +718,7 @@ class PromptStackLoader:
 
         current_lines = list(lines)
         present = None
-        for mod_type, target_key, new_path in modifiers:
+        for mod_idx, (mod_type, target_key, new_path) in enumerate(modifiers):
             if budget.get("modifiers", 0) >= cls.MAX_TOTAL_MODIFIERS:
                 if not budget.get("modifier_limit_warned"):
                     print(f"[Adaptive Prompts] Warning: Maximum total modifiers ({cls.MAX_TOTAL_MODIFIERS}) exceeded. Skipping remaining 'remove:'/'replace:' directives.")
@@ -601,6 +741,7 @@ class PromptStackLoader:
             matched = False
             next_lines = []
             replacement_payload = None
+            mod_vars = modifier_vars_list[mod_idx] if modifier_vars_list is not None else None
 
             def _get_replacement_payload():
                 nonlocal replacement_payload
@@ -615,6 +756,8 @@ class PromptStackLoader:
                         apply_scope_modifiers=True,
                         log_unused=log_unused,
                         budget=budget,
+                        template_vars=mod_vars,
+                        source_label=new_path,
                     )
                 else:
                     replacement_payload = [new_path]
@@ -703,17 +846,23 @@ class PromptStackLoader:
         current_dir: str = None,
         prefix_lines: List[str] = None,
         budget: dict = None,
+        template_vars: Optional[dict] = None,
+        source_label: str = "stack",
     ) -> List[str]:
         """
-        Recursively expands `import:<relative_path>` directives in-place with subtree-scoped
-        modifier evaluation and current-file-relative (`./` and `../`) path resolution.
+        Recursively expands `import:<relative_path>` directives in-place with shell-style
+        `set:<name>=<value>` / `${name}` template substitution, subtree-scoped modifier
+        evaluation, and current-file-relative (`./` and `../`) path resolution.
 
         How nested scopes work:
-        1. Sanitization & Relative Coordinate Canonicalization: User lines are stripped of
-           comments, blank lines, and spoofed internal markers. Any path starting with `./`
-           or `../` is resolved relative to `current_dir` (that stack file's directory) and
-           translated into a `resolved_base_dir`-relative path. Paths without leading `./`
-           or `../` resolve directly against `resolved_base_dir`.
+        1. Template Variables & Sequential Expansion: `local_vars` starts as a shallow copy
+           of inherited `template_vars` from the parent scope. As lines are scanned top-to-bottom:
+           - `set:name=value` updates `local_vars` for lines and imports *below* it in this file
+             (and any nested imports they open), without leaking upward to the parent or sideways
+             into sibling imports.
+           - All other lines run single-pass `string.Template` substitution (`$var`/`${var}`,
+             `$$` for literal `$`) before relative canonicalization, modifier parsing, and
+             security validation. Undefined or malformed placeholders log a warning and skip the line.
         2. Recursive Import Pass: Each `import:` line is validated against:
            - `_is_safe_relative_ref(...)` to reject absolute/UNC/drive/ADS/reserved paths.
            - `MAX_IMPORT_DEPTH` (32) and `MAX_TOTAL_IMPORTS` (512) / `MAX_EXPANDED_LINES`
@@ -723,10 +872,8 @@ class PromptStackLoader:
              symlink loops, hard-link loops, and case-insensitive FS cycles) while allowing
              sequential non-cyclic reuse of the same snippet.
            - The 5MB file size limit.
-           Each imported file is resolved with `apply_scope_modifiers=True` and
-           `current_dir=os.path.dirname(resolved_import)`, meaning its `./` and `../` paths
-           anchor to its own directory and its internal `remove:` and `replace:` commands only
-           affect its own subtree.
+           Each imported file inherits the snapshot of `local_vars` active at that `import:` line,
+           with `apply_scope_modifiers=True` and `current_dir=os.path.dirname(resolved_import)`.
         3. Post-Import Modifier Pass: When `apply_scope_modifiers=True`, the current scope's
            `remove:` and `replace:` modifiers execute in exact written order over the expanded
            lines (including any trusted `prefix_lines` and both direct and nested imports).
@@ -738,39 +885,102 @@ class PromptStackLoader:
         if budget is None:
             budget = cls._new_expansion_budget()
 
-        content_and_imports = []
+        # Copy inherited variables so child `set:` directives never leak upward or sideways.
+        local_vars = dict(template_vars) if template_vars else {}
         raw_modifier_lines = []
         parsed_modifiers = []
+        modifier_vars_list = []
 
+        # Step 1: Start from any already-expanded trusted prefix lines (e.g., from stack_file)
+        # and process `set:`, template substitution, normal paths, modifiers, and `import:` lines
+        # in top-to-bottom order so each `import:` sees the exact `local_vars` defined above it.
+        expanded = list(prefix_lines) if prefix_lines else []
         for line in raw_lines:
             clean_line = line.strip()
             if not clean_line or clean_line.startswith("#") or cls._is_import_marker(clean_line):
                 continue
-            scoped_line = cls._canonicalize_scoped_line(clean_line, current_dir, resolved_base_dir)
-            if cls._is_modifier_line(scoped_line):
-                mod = cls._parse_modifier(scoped_line)
-                if mod is not None:
-                    raw_modifier_lines.append(scoped_line)
-                    parsed_modifiers.append(mod)
-                else:
-                    print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
-            else:
-                content_and_imports.append(scoped_line)
 
-        # Step 1: Start from any already-expanded trusted prefix lines (e.g., from stack_file)
-        # and expand all `import:` lines in-place.
-        expanded = list(prefix_lines) if prefix_lines else []
-        for line in content_and_imports:
-            clean_line = line.strip()
-            if not clean_line.startswith("import:"):
+            if cls._is_set_line(clean_line):
+                parsed_set = cls._parse_set_directive(clean_line)
+                if parsed_set is None:
+                    if log_unused:
+                        print(f"[Adaptive Prompts] Warning: Invalid 'set:' directive '{clean_line}' in '{source_label}'. Expected 'set:name=value'. Skipping.")
+                    continue
+                var_name, raw_val = parsed_set
+                if var_name not in local_vars and len(local_vars) >= cls.MAX_TEMPLATE_VARS:
+                    if log_unused:
+                        print(f"[Adaptive Prompts] Warning: Maximum template variables ({cls.MAX_TEMPLATE_VARS}) exceeded at '{var_name}' in '{source_label}'. Skipping.")
+                    continue
+                resolved_val = cls._substitute_template_line(raw_val, local_vars, source_label, log_warnings=log_unused)
+                if resolved_val is None:
+                    continue
+                if len(resolved_val) > cls.MAX_VAR_VALUE_LEN:
+                    if log_unused:
+                        print(f"[Adaptive Prompts] Warning: Value for stack variable '{var_name}' exceeds {cls.MAX_VAR_VALUE_LEN} character limit in '{source_label}'. Skipping.")
+                    continue
+                local_vars[var_name] = resolved_val
+                continue
+
+            # Parse command structure BEFORE template substitution (prepared-statement
+            # discipline) so variable values cannot inject delimiters (`|`, `=`) or
+            # hijack non-modifier lines into `set:`, `remove:`, or `replace:` commands.
+            if cls._is_modifier_line(clean_line):
+                if clean_line.startswith("remove:"):
+                    raw_target = clean_line[len("remove:"):].strip()
+                    sub_target = cls._substitute_template_line(raw_target, local_vars, source_label, log_warnings=log_unused)
+                    if sub_target is None:
+                        continue
+                    c_target = cls._canonicalize_scoped_ref(sub_target, current_dir, resolved_base_dir)
+                    mod = cls._parse_modifier_parts("remove", c_target)
+                    raw_mod_str = f"remove:{c_target}"
+                else:
+                    parts = clean_line[len("replace:"):].split("|", 1)
+                    if len(parts) != 2:
+                        if log_unused:
+                            print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
+                        continue
+                    sub_old = cls._substitute_template_line(parts[0].strip(), local_vars, source_label, log_warnings=log_unused)
+                    if sub_old is None:
+                        continue
+                    sub_new = cls._substitute_template_line(parts[1].strip(), local_vars, source_label, log_warnings=log_unused)
+                    if sub_new is None:
+                        continue
+                    c_old = cls._canonicalize_scoped_ref(sub_old, current_dir, resolved_base_dir)
+                    c_new = cls._canonicalize_scoped_ref(sub_new, current_dir, resolved_base_dir)
+                    mod = cls._parse_modifier_parts("replace", c_old, c_new)
+                    raw_mod_str = f"replace:{c_old}|{c_new}"
+
+                if mod is not None:
+                    raw_modifier_lines.append(raw_mod_str)
+                    parsed_modifiers.append(mod)
+                    modifier_vars_list.append(dict(local_vars))
+                else:
+                    if log_unused:
+                        print(f"[Adaptive Prompts] Warning: Invalid modifier directive '{clean_line}'. Skipping.")
+                continue
+
+            substituted = cls._substitute_template_line(clean_line, local_vars, source_label, log_warnings=log_unused)
+            if substituted is None:
+                continue
+            substituted = substituted.strip()
+            if not substituted or substituted.startswith("#") or cls._is_import_marker(substituted):
+                continue
+            if cls._is_set_line(substituted) or cls._is_modifier_line(substituted):
+                if log_unused:
+                    print(f"[Adaptive Prompts] Warning: Command directive cannot be injected via template substitution in '{source_label}' (line: '{clean_line}'). Skipping.")
+                continue
+
+            scoped_line = cls._canonicalize_scoped_ref(substituted, current_dir, resolved_base_dir)
+
+            if not scoped_line.startswith("import:"):
                 if len(expanded) < cls.MAX_EXPANDED_LINES:
-                    expanded.append(line)
+                    expanded.append(scoped_line)
                 elif not budget["line_limit_warned"]:
                     print(f"[Adaptive Prompts] Warning: Maximum expanded stack lines ({cls.MAX_EXPANDED_LINES}) exceeded. Truncating excess lines.")
                     budget["line_limit_warned"] = True
                 continue
 
-            import_target = clean_line[len("import:"):].strip().replace("\\", "/")
+            import_target = scoped_line[len("import:"):].strip().replace("\\", "/")
             if not import_target:
                 print("[Adaptive Prompts] Warning: Empty 'import:' directive. Skipping.")
                 continue
@@ -823,7 +1033,7 @@ class PromptStackLoader:
             if visited_stack_files is not None and resolved_import not in visited_stack_files:
                 visited_stack_files.append(resolved_import)
 
-            norm_import_key = cls._normalize_match(clean_line)
+            norm_import_key = cls._normalize_match(scoped_line)
             child_expanded = cls._expand_import_lines(
                 imported_lines,
                 resolved_base_dir,
@@ -833,6 +1043,8 @@ class PromptStackLoader:
                 log_unused=log_unused,
                 current_dir=os.path.dirname(resolved_import),
                 budget=budget,
+                template_vars=local_vars,
+                source_label=import_target,
             )
             if len(expanded) + len(child_expanded) + 2 <= cls.MAX_EXPANDED_LINES:
                 expanded.append(f"{cls._IMPORT_BEGIN_PREFIX}{norm_import_key}")
@@ -853,6 +1065,7 @@ class PromptStackLoader:
                 expand_replacement_imports=True,
                 log_unused=log_unused,
                 budget=budget,
+                modifier_vars_list=modifier_vars_list,
             )
 
         return expanded + raw_modifier_lines
@@ -921,6 +1134,7 @@ class PromptStackLoader:
                                 log_unused=log_unused,
                                 current_dir=stack_current_dir,
                                 budget=budget,
+                                source_label=raw_stack_file,
                             )
                     except (OSError, UnicodeDecodeError) as e:
                         if log_stack_warnings:
@@ -939,12 +1153,13 @@ class PromptStackLoader:
                 current_dir=resolved_base_dir,
                 prefix_lines=stack_expanded,
                 budget=budget,
+                source_label="inline_stack",
             )
 
         return stack_expanded
 
     @classmethod
-    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None):
+    def IS_CHANGED(cls, base_dir, stack_file, inline_stack, override_context=False, seed=0, context=None, debug_log=False):
         import hashlib
         m = hashlib.sha256()
 
@@ -1275,7 +1490,7 @@ class PromptStackLoader:
 
         return evaluated_text.strip(), found_loras
 
-    def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None):
+    def process(self, seed: int, base_dir: str, stack_file: str, inline_stack: str, override_context: bool = False, context: dict = None, debug_log: bool = False):
         _sync_base_config()
         rng = SeededRandom(seed)
 
@@ -1283,6 +1498,15 @@ class PromptStackLoader:
 
         raw_lines = self._resolve_paths(resolved_base_dir, stack_file, inline_stack)
         files_to_process = self._build_final_file_list(raw_lines, resolved_base_dir, rng)
+
+        if debug_log:
+            print(f"[Adaptive Prompts] Resolved stack ({len(files_to_process)} files, base_dir='{resolved_base_dir}'):")
+            for idx, fpath in enumerate(files_to_process, start=1):
+                try:
+                    rel_display = os.path.relpath(fpath, resolved_base_dir).replace("\\", "/")
+                except ValueError:
+                    rel_display = fpath
+                print(f"  {idx:02d}. {rel_display}")
 
         current_context = {}
         if context is not None:
